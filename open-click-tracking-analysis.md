@@ -6,9 +6,9 @@
 2. [跟踪像素 (Tracking Pixel) 实现](#跟踪像素-tracking-pixel-实现)
 3. [链接点击追踪 (Link Click Tracking) 实现](#链接点击追踪-link-click-tracking-实现)
 4. [数据模型与存储](#数据模型与存储)
-5. [跨域回写机制与 CORS](#跨域回写机制与-cors)
+5. [跨域回写机制与完整闭环](#跨域回写机制与完整闭环)
 6. [隐私与追踪控制](#隐私与追踪控制)
-7. [统计数据聚合](#统计数据聚合)
+7. [统计数据聚合与管理端读取](#统计数据聚合与管理端读取)
 8. [实现架构图](#实现架构图)
 
 ---
@@ -20,7 +20,7 @@ Listmonk 实现了两种核心的邮件追踪机制：
 - **打开追踪 (Open Tracking)**: 通过透明像素图片实现
 - **点击追踪 (Click Tracking)**: 通过中间重定向链接实现
 
-两种机制都依赖于 HTTP 请求到 listmonk 服务器，从而触发统计数据的记录。
+两种机制都依赖于 HTTP 请求到 listmonk 服务器，从而触发统计数据的记录。本文档详细分析从追踪请求入口、事件落库、统计聚合到管理端展示的完整闭环。
 
 ---
 
@@ -28,7 +28,9 @@ Listmonk 实现了两种核心的邮件追踪机制：
 
 ### 1. 工作原理
 
-跟踪像素是一个 3x14 像素的透明 PNG 图片，嵌入在邮件 HTML 正文中。当邮件客户端加载图片时，会向 listmonk 服务器发送 HTTP 请求，从而记录这次"打开"事件。
+跟踪像素是一个 **14x3 像素（宽x高）**的透明 PNG 图片，嵌入在邮件 HTML 正文中。当邮件客户端加载图片时，会向 listmonk 服务器发送 HTTP 请求，从而记录这次"打开"事件。
+
+> **注意**: 尺寸描述采用标准的 `宽 x 高` 格式。
 
 ### 2. 关键实现代码
 
@@ -54,6 +56,15 @@ func drawTransparentImage(h, w int) []byte {
     return out.Bytes()
 }
 ```
+
+**尺寸计算分析**：
+- 函数签名: `drawTransparentImage(h, w int)`
+- 调用时: `drawTransparentImage(3, 14)` → `h=3`, `w=14`
+- Go 标准库 `image.Rect(x0, y0, x1, y1)` 定义矩形
+- `image.Rect(0, 0, w, h)` = `image.Rect(0, 0, 14, 3)`
+- 宽度 = 14 - 0 = **14 像素**
+- 高度 = 3 - 0 = **3 像素**
+- 最终尺寸: **14 x 3 像素（宽 x 高）**
 
 #### 2.2 模板函数 - TrackView
 
@@ -141,13 +152,41 @@ INSERT INTO campaign_views (campaign_id, subscriber_id)
     VALUES((SELECT campaign_id FROM view), (SELECT subscriber_id FROM view));
 ```
 
-### 3. 路由注册
+### 3. 路由注册与中间件
 
 **位置**: `cmd/handlers.go:279`
 
 ```go
 g.GET("/campaign/:campUUID/:subUUID/px.png", 
     noIndex(a.hasUUID(a.RegisterCampaignView, "campUUID", "subUUID")))
+```
+
+**中间件链路**（从外到内执行）：
+
+| 中间件 | 功能 | 代码位置 |
+|--------|------|----------|
+| `noIndex` | 添加 `X-Robots-Tag: noindex` 响应头，防止搜索引擎索引 | `cmd/handlers.go:405-411` |
+| `hasUUID` | 验证 URL 参数中的 UUID 格式（正则校验） | `cmd/handlers.go:358-369` |
+
+> **重要事实修正**：追踪端点 `/campaign/:campUUID/:subUUID/px.png` **没有 `hasSub` 中间件**。`hasSub` 只用于订阅相关页面（如 `/subscription/:campUUID/:subUUID`），用于验证订阅者是否存在。
+
+`hasSub` 中间件定义（但追踪端点不使用）：
+
+**位置**: `cmd/handlers.go:384-403`
+
+```go
+// hasSub middleware checks if a subscriber exists given the UUID
+// param in a request.
+func (a *App) hasSub(next echo.HandlerFunc) echo.HandlerFunc {
+    return func(c echo.Context) error {
+        subUUID := c.Param("subUUID")
+
+        if _, err := a.core.GetSubscriber(0, subUUID, ""); err != nil {
+            // ... 订阅者不存在时返回 404
+        }
+        return next(c)
+    }
+}
 ```
 
 ---
@@ -327,7 +366,7 @@ INSERT INTO link_clicks (campaign_id, subscriber_id, link_id) VALUES(
 ) RETURNING (SELECT url FROM link);
 ```
 
-### 3. 路由注册
+### 3. 路由注册与中间件
 
 **位置**: `cmd/handlers.go:277`
 
@@ -335,6 +374,15 @@ INSERT INTO link_clicks (campaign_id, subscriber_id, link_id) VALUES(
 g.GET("/link/:linkUUID/:campUUID/:subUUID", 
     noIndex(a.hasUUID(a.LinkRedirect, "linkUUID", "campUUID", "subUUID")))
 ```
+
+**中间件链路**（与像素追踪相同）：
+
+| 中间件 | 功能 |
+|--------|------|
+| `noIndex` | 添加 `X-Robots-Tag: noindex` |
+| `hasUUID` | 验证 URL 参数中的 UUID 格式 |
+
+> **同样重要**：链接追踪端点 `/link/:linkUUID/:campUUID/:subUUID` **也没有 `hasSub` 中间件**。这意味着即使订阅者 UUID 无效或对应订阅者已删除，请求仍然会被处理（但 `subscriber_id` 会被设置为 NULL）。
 
 ---
 
@@ -447,7 +495,7 @@ links (id) ────────────< link_clicks (link_id) [CASCADE]
 
 ---
 
-## 跨域回写机制与 CORS
+## 跨域回写机制与完整闭环
 
 ### 1. CORS 配置
 
@@ -463,7 +511,7 @@ if len(a.cfg.Security.CorsOrigins) > 0 {
 }
 ```
 
-### 2. 配置项
+**配置项**：
 
 **位置**: `schema.sql:264`
 
@@ -471,15 +519,9 @@ if len(a.cfg.Security.CorsOrigins) > 0 {
 ('security.cors_origins', '[]'),
 ```
 
-**位置**: `cmd/init.go:127`
+### 2. 追踪请求的跨域处理
 
-```go
-CorsOrigins []string `koanf:"cors_origins"`
-```
-
-### 3. 跨域场景分析
-
-#### 3.1 跟踪像素请求
+#### 2.1 跟踪像素请求
 
 跟踪像素的请求是通过 `<img>` 标签发起的，属于**简单请求**，不受 CORS 限制：
 
@@ -487,7 +529,7 @@ CorsOrigins []string `koanf:"cors_origins"`
 <img src="https://listmonk.example.com/campaign/xxx/yyy/px.png" alt="" />
 ```
 
-#### 3.2 链接重定向请求
+#### 2.2 链接重定向请求
 
 链接点击通过 `GET /link/:uuid` 发起，重定向使用 **307 Temporary Redirect**：
 
@@ -501,21 +543,208 @@ Location: https://original-url.com/path
 
 **注意**：307 重定向会保持原始请求方法，但对于链接点击通常是 GET 请求，不影响。
 
-#### 3.3 需要 CORS 的场景
+### 3. 完整回写闭环分析
 
-以下场景可能需要配置 `cors_origins`：
+#### 3.1 闭环流程图
 
-1. **内嵌表单**：如果订阅表单嵌入在外部网站
-2. **自定义前端**：使用 listmonk API 的自定义前端
-3. **Webhook 回调**：外部服务回调 listmonk 端点
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                           完整追踪回写闭环                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────┐                                                        │
+│  │  邮件客户端      │                                                        │
+│  │  ┌───────────┐  │                                                        │
+│  │  │ <img src= │  │                                                        │
+│  │  │  px.png> │  │                                                        │
+│  │  │ <a href=  │  │                                                        │
+│  │  │ /link/...>│  │                                                        │
+│  │  └─────┬─────┘  │                                                        │
+│  └────────┼─────────┘                                                        │
+│           │                                                                    │
+│           │ HTTP GET 请求                                                      │
+│           v                                                                    │
+│  ┌────────────────────────────────────────────────────────────────────┐     │
+│  │                        阶段 1: 请求入口与中间件                      │     │
+│  ├────────────────────────────────────────────────────────────────────┤     │
+│  │  中间件执行顺序（从外到内）：                                          │     │
+│  │                                                                      │     │
+│  │  1. noIndex()                                                        │     │
+│  │     └──> 添加 X-Robots-Tag: noindex 响应头                         │     │
+│  │                                                                      │     │
+│  │  2. hasUUID()                                                        │     │
+│  │     └──> 正则校验 UUID 格式: ^[0-9a-fA-F]{8}-...$                 │     │
+│  │           - 校验失败: 返回 400 "invalid UUID"                       │     │
+│  │           - 校验成功: 继续执行                                        │     │
+│  │                                                                      │     │
+│  │  注意: 追踪端点 NO hasSub()！                                        │     │
+│  │        订阅者 ID 验证只在订阅相关页面执行                              │     │
+│  └────────────────────────────────────────────────────────────────────┘     │
+│           │                                                                    │
+│           v                                                                    │
+│  ┌────────────────────────────────────────────────────────────────────┐     │
+│  │                        阶段 2: 隐私控制分支判断                       │     │
+│  ├────────────────────────────────────────────────────────────────────┤     │
+│  │                                                                      │     │
+│  │  ┌────────────────────────────────────────────────────────────┐   │     │
+│  │  │ 分支 A: 全局禁用追踪 (DisableTracking = true)               │   │     │
+│  │  ├────────────────────────────────────────────────────────────┤   │     │
+│  │  │  像素追踪:                                                    │   │     │
+│  │  │    └──> 直接返回 14x3 PNG，不插入 campaign_views           │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  链接追踪:                                                    │   │     │
+│  │  │    └──> 只查询 links 表获取原始 URL                           │   │     │
+│  │  │    └──> 307 重定向，不插入 link_clicks                       │   │     │
+│  │  └────────────────────────────────────────────────────────────┘   │     │
+│  │                           │                                          │     │
+│  │                           v (DisableTracking = false)               │     │
+│  │  ┌────────────────────────────────────────────────────────────┐   │     │
+│  │  │ 分支 B: 匿名追踪 (IndividualTracking = false)               │   │     │
+│  │  ├────────────────────────────────────────────────────────────┤   │     │
+│  │  │  subUUID 处理:                                               │   │     │
+│  │  │    └──> 将 subUUID 设为空字符串 ""                          │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  SQL 层面:                                                    │   │     │
+│  │  │    LEFT JOIN subscribers ON                                  │   │     │
+│  │  │      CASE WHEN $2::TEXT != '' THEN ... ELSE FALSE END      │   │     │
+│  │  │    └──> subUUID 为空时，subscriber_id = NULL               │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  记录效果:                                                    │   │     │
+│  │  │    └──> campaign_views / link_clicks 表记录事件             │   │     │
+│  │  │    └──> subscriber_id = NULL (匿名化)                        │   │     │
+│  │  └────────────────────────────────────────────────────────────┘   │     │
+│  │                           │                                          │     │
+│  │                           v (IndividualTracking = true)            │     │
+│  │  ┌────────────────────────────────────────────────────────────┐   │     │
+│  │  │ 分支 C: 个体追踪 (IndividualTracking = true)                │   │     │
+│  │  ├────────────────────────────────────────────────────────────┤   │     │
+│  │  │  subUUID 处理:                                               │   │     │
+│  │  │    └──> 保持 URL 中的原始 subUUID                           │   │     │
+│  │  │    └──> 但需要排除 dummyUUID (全零)                         │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  Dummy UUID 排除逻辑:                                         │   │     │
+│  │  │    if campUUID != dummyUUID && subUUID != dummyUUID {      │   │     │
+│  │  │        // 执行记录操作                                        │   │     │
+│  │  │    }                                                         │   │     │
+│  │  │    └──> 模板预览使用全零 UUID，不记录统计                    │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  记录效果:                                                    │   │     │
+│  │  │    └──> subscriber_id = 实际订阅者 ID                       │   │     │
+│  │  │    └──> 可追踪每个订阅者的具体行为                            │   │     │
+│  │  └────────────────────────────────────────────────────────────┘   │     │
+│  └────────────────────────────────────────────────────────────────────┘     │
+│           │                                                                    │
+│           v                                                                    │
+│  ┌────────────────────────────────────────────────────────────────────┐     │
+│  │                        阶段 3: 事件落库                              │     │
+│  ├────────────────────────────────────────────────────────────────────┤     │
+│  │                                                                      │     │
+│  │  像素追踪:                                                           │     │
+│  │  ┌────────────────────────────────────────────────────────────┐   │     │
+│  │  │ INSERT INTO campaign_views                                   │   │     │
+│  │  │   (campaign_id, subscriber_id)                               │   │     │
+│  │  │ VALUES                                                        │   │     │
+│  │  │   (SELECT campaigns.id WHERE uuid = $1,                     │   │     │
+│  │  │    SELECT subscribers.id WHERE uuid = $2)                   │   │     │
+│  │  └────────────────────────────────────────────────────────────┘   │     │
+│  │                                                                      │     │
+│  │  链接追踪:                                                           │     │
+│  │  ┌────────────────────────────────────────────────────────────┐   │     │
+│  │  │ INSERT INTO link_clicks                                      │   │     │
+│  │  │   (campaign_id, subscriber_id, link_id)                     │   │     │
+│  │  │ VALUES                                                        │   │     │
+│  │  │   (SELECT campaigns.id WHERE uuid = $2,                     │   │     │
+│  │  │    SELECT subscribers.id WHERE uuid = $3,                   │   │     │
+│  │  │    SELECT links.id WHERE uuid = $1)                          │   │     │
+│  │  │ RETURNING (SELECT url FROM link)                             │   │     │
+│  │  └────────────────────────────────────────────────────────────┘   │     │
+│  │                                                                      │     │
+│  │  外键异常处理:                                                       │     │
+│  │    └──> campaign_id 不存在 → 静默忽略 (返回 nil)                   │     │
+│  │    └──> link_id 不存在 → 返回错误 "invalid link"                   │     │
+│  │    └──> subscriber_id 不存在 → subscriber_id = NULL               │     │
+│  └────────────────────────────────────────────────────────────────────┘     │
+│           │                                                                    │
+│           v                                                                    │
+│  ┌────────────────────────────────────────────────────────────────────┐     │
+│  │                        阶段 4: 响应返回                              │     │
+│  ├────────────────────────────────────────────────────────────────────┤     │
+│  │                                                                      │     │
+│  │  像素追踪:                                                           │     │
+│  │    └──> Content-Type: image/png                                     │     │
+│  │    └──> Cache-Control: no-cache                                     │     │
+│  │    └──> 14x3 透明 PNG 二进制数据                                   │     │
+│  │                                                                      │     │
+│  │  链接追踪:                                                           │     │
+│  │    └──> Status: 307 Temporary Redirect                             │     │
+│  │    └──> Location: {原始 URL}                                        │     │
+│  │                                                                      │     │
+│  │  失败安全设计 (Fail-Safe):                                          │     │
+│  │    └──> 即使数据库插入失败，仍然返回响应                            │     │
+│  │    └──> 不影响用户体验                                              │     │
+│  └────────────────────────────────────────────────────────────────────┘     │
+│           │                                                                    │
+│           v                                                                    │
+│  ┌────────────────────────────────────────────────────────────────────┐     │
+│  │                        阶段 5: 统计聚合与管理端展示                  │     │
+│  ├────────────────────────────────────────────────────────────────────┤     │
+│  │                                                                      │     │
+│  │  启动时动态查询准备 (prepareQueries):                               │     │
+│  │    ┌──────────────────────────────────────────────────────────┐   │     │
+│  │    │ IndividualTracking = true                                  │   │     │
+│  │    │   └──> 使用去重计数查询 (DISTINCT ON subscriber_id)       │   │     │
+│  │    │   └──> 每个订阅者只计一次                                   │   │     │
+│  │    │                                                             │   │     │
+│  │    │ IndividualTracking = false                                 │   │     │
+│  │    │   └──> 使用普通计数查询 (COUNT(*))                         │   │     │
+│  │    │   └──> 每次访问都计数                                       │   │     │
+│  │    └──────────────────────────────────────────────────────────┘   │     │
+│  │                                                                      │     │
+│  │  管理端 API 端点:                                                    │     │
+│  │    └──> GET /api/campaigns/analytics/:type                        │     │
+│  │    └──> 需要权限: campaigns:get_analytics                          │     │
+│  │                                                                      │     │
+│  │  统计类型:                                                           │     │
+│  │    ┌──────────────┬────────────────────────────────────────────┐  │     │
+│  │    │ type = views │ 按小时/天聚合的打开时间序列                  │  │     │
+│  │    ├──────────────┼────────────────────────────────────────────┤  │     │
+│  │    │ type = clicks│ 按小时/天聚合的点击时间序列                  │  │     │
+│  │    ├──────────────┼────────────────────────────────────────────┤  │     │
+│  │    │ type = links │ 各链接的点击次数排行榜 (TOP 50)             │  │     │
+│  │    └──────────────┴────────────────────────────────────────────┘  │     │
+│  │                                                                      │     │
+│  │  时间粒度自动选择:                                                   │     │
+│  │    └──> 时间间隔 < 7 天: 按小时聚合                                │     │
+│  │    └──> 时间间隔 >= 7 天: 按天聚合                                 │     │
+│  └────────────────────────────────────────────────────────────────────┘     │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
 
-### 4. 实际追踪流程的跨域处理
+#### 3.2 隐私分支的详细对比
 
-由于追踪机制使用的是：
-- `<img>` 标签（像素追踪）- 无 CORS 限制
-- HTTP 重定向（链接追踪）- 浏览器自动处理，无 CORS 问题
+| 配置组合 | DisableTracking | IndividualTracking | 模板渲染 | 请求处理 | 数据库记录 |
+|---------|-----------------|--------------------|----------|----------|------------|
+| **全局禁用** | `true` | - | 不嵌入像素/不重写链接 | 返回响应但跳过记录 | 无记录 |
+| **匿名追踪** | `false` | `false` | 嵌入像素/重写链接，但 subUUID = dummyUUID | subUUID 置空字符串 | 记录事件，subscriber_id = NULL |
+| **个体追踪** | `false` | `true` | 嵌入像素/重写链接，使用真实 subUUID | 保留原始 subUUID | 记录事件，subscriber_id = 实际 ID |
 
-**因此，邮件追踪本身不需要 CORS 配置**。CORS 主要用于 API 调用场景。
+#### 3.3 CORS 与追踪请求的关系
+
+**重要结论**：邮件追踪本身**不需要**配置 CORS。
+
+原因分析：
+
+| 追踪类型 | 请求方式 | 浏览器行为 | CORS 限制 |
+|---------|----------|------------|----------|
+| 像素追踪 | `<img src="...">` | 简单资源请求 | 无限制 |
+| 链接追踪 | `<a href="...">` 点击 | 页面导航/重定向 | 无限制 |
+
+**需要 CORS 的场景**：
+
+1. **内嵌订阅表单**：外部网站嵌入订阅表单，通过 AJAX 调用 `POST /api/public/subscription`
+2. **自定义前端**：独立部署的管理前端，通过 API 访问 listmonk
+3. **管理端 SPA**：前端 JavaScript 调用管理 API
 
 ---
 
@@ -650,7 +879,7 @@ if campUUID != dummyUUID && subUUID != dummyUUID {
 
 ---
 
-## 统计数据聚合
+## 统计数据聚合与管理端读取
 
 ### 1. 活动统计查询
 
@@ -756,6 +985,48 @@ func prepareQueries(qMap goyesql.Queries, db *sqlx.DB, ko *koanf.Koanf) *models.
 }
 ```
 
+### 6. 管理端 API 处理
+
+**位置**: `cmd/campaigns.go:603-642`
+
+```go
+func (a *App) GetCampaignViewAnalytics(c echo.Context) error {
+    ids, err := parseStringIDs(c.Request().URL.Query()["id"])
+    // ... 参数验证
+
+    var (
+        typ  = c.Param("type")  // views | clicks | links
+        from = c.QueryParams().Get("from")
+        to   = c.QueryParams().Get("to")
+    )
+
+    // 链接统计
+    if typ == "links" {
+        out, err := a.core.GetCampaignAnalyticsLinks(ids, typ, from, to)
+        if err != nil {
+            return err
+        }
+        return c.JSON(http.StatusOK, okResp{out})
+    }
+
+    // 视图/点击统计（时间序列）
+    out, err := a.core.GetCampaignAnalyticsCounts(ids, typ, from, to)
+    if err != nil {
+        return err
+    }
+
+    return c.JSON(http.StatusOK, okResp{out})
+}
+```
+
+**路由注册**：
+
+**位置**: `cmd/handlers.go:164`
+
+```go
+g.GET("/api/campaigns/analytics/:type", pm(a.GetCampaignViewAnalytics, "campaigns:get_analytics"))
+```
+
 ---
 
 ## 实现架构图
@@ -812,10 +1083,43 @@ func prepareQueries(qMap goyesql.Queries, db *sqlx.DB, ko *koanf.Koanf) *models.
 │                         │                    │                        │
 │                         v                    v                        │
 │  ┌──────────────────────────────────────────────────────────────┐   │
-│  │                    Echo 路由中间件                              │   │
-│  │  - hasUUID()          UUID 格式校验                            │   │
-│  │  - hasSub()           订阅者存在校验                            │   │
-│  │  - noIndex()          禁止搜索引擎索引                          │   │
+│  │                    Echo 路由中间件（修正后）                    │   │
+│  │                                                                  │   │
+│  │  像素追踪端点:                                                   │   │
+│  │    GET /campaign/:campUUID/:subUUID/px.png                    │   │
+│  │    ┌─────────────┐                                              │   │
+│  │    │ noIndex()   │ ──> X-Robots-Tag: noindex                  │   │
+│  │    └──────┬──────┘                                              │   │
+│  │           v                                                       │   │
+│  │    ┌─────────────┐                                              │   │
+│  │    │ hasUUID()   │ ──> 正则校验 UUID 格式                       │   │
+│  │    └──────┬──────┘                                              │   │
+│  │           v                                                       │   │
+│  │    ┌─────────────────────────────────┐                         │   │
+│  │    │ RegisterCampaignView()          │                         │   │
+│  │    │ - 没有 hasSub！                 │                         │   │
+│  │    │ - 不验证订阅者是否存在          │                         │   │
+│  │    └─────────────────────────────────┘                         │   │
+│  │                                                                  │   │
+│  │  链接追踪端点:                                                   │   │
+│  │    GET /link/:linkUUID/:campUUID/:subUUID                     │   │
+│  │    ┌─────────────┐                                              │   │
+│  │    │ noIndex()   │ ──> X-Robots-Tag: noindex                  │   │
+│  │    └──────┬──────┘                                              │   │
+│  │           v                                                       │   │
+│  │    ┌─────────────┐                                              │   │
+│  │    │ hasUUID()   │ ──> 正则校验 UUID 格式                       │   │
+│  │    └──────┬──────┘                                              │   │
+│  │           v                                                       │   │
+│  │    ┌─────────────────────────────────┐                         │   │
+│  │    │ LinkRedirect()                  │                         │   │
+│  │    │ - 没有 hasSub！                 │                         │   │
+│  │    │ - 不验证订阅者是否存在          │                         │   │
+│  │    └─────────────────────────────────┘                         │   │
+│  │                                                                  │   │
+│  │  注意: hasSub 只用于订阅相关页面，如:                           │   │
+│  │       /subscription/:campUUID/:subUUID                          │   │
+│  │       /subscription/optin/:subUUID                              │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                         │                    │                        │
 │                         v                    v                        │
@@ -825,7 +1129,7 @@ func prepareQueries(qMap goyesql.Queries, db *sqlx.DB, ko *koanf.Koanf) *models.
 │  │ - 检查个体追踪            │    │ - 检查个体追踪                │   │
 │  │ - 排除 dummy UUID        │    │ - 记录点击到 link_clicks      │   │
 │  │ - 插入 campaign_views    │    │ - 307 重定向到原始 URL       │   │
-│  │ - 返回透明 PNG            │    └──────────────────────────────┘   │
+│  │ - 返回 14x3 透明 PNG     │    └──────────────────────────────┘   │
 │  └──────────────────────────┘                                         │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -864,12 +1168,13 @@ func prepareQueries(qMap goyesql.Queries, db *sqlx.DB, ko *koanf.Koanf) *models.
 
 ### 3. URL 格式汇总
 
-| 类型 | URL 格式 | 处理函数 |
-|------|----------|----------|
-| 打开追踪像素 | `{root}/campaign/{campUUID}/{subUUID}/px.png` | `RegisterCampaignView` |
-| 链接追踪重定向 | `{root}/link/{linkUUID}/{campUUID}/{subUUID}` | `LinkRedirect` |
-| 邮件在线查看 | `{root}/campaign/{campUUID}/{subUUID}` | `ViewCampaignMessage` |
-| 退订页面 | `{root}/subscription/{campUUID}/{subUUID}` | `SubscriptionPage` |
+| 类型 | URL 格式 | 处理函数 | 中间件 |
+|------|----------|----------|--------|
+| 打开追踪像素 | `{root}/campaign/{campUUID}/{subUUID}/px.png` | `RegisterCampaignView` | `noIndex` → `hasUUID` |
+| 链接追踪重定向 | `{root}/link/{linkUUID}/{campUUID}/{subUUID}` | `LinkRedirect` | `noIndex` → `hasUUID` |
+| 邮件在线查看 | `{root}/campaign/{campUUID}/{subUUID}` | `ViewCampaignMessage` | `noIndex` → `hasUUID` |
+| 订阅管理页面 | `{root}/subscription/:campUUID/:subUUID` | `SubscriptionPage` | `noIndex` → `hasUUID` → `hasSub` |
+| 统计分析 API | `{root}/api/campaigns/analytics/:type` | `GetCampaignViewAnalytics` | `pm (权限校验)` |
 
 ---
 
@@ -878,39 +1183,60 @@ func prepareQueries(qMap goyesql.Queries, db *sqlx.DB, ko *koanf.Koanf) *models.
 | 功能 | 文件路径 |
 |------|----------|
 | HTTP 处理器 | `cmd/public.go` |
-| 路由注册 | `cmd/handlers.go` |
+| 路由注册与中间件 | `cmd/handlers.go` |
 | 追踪模板函数 | `internal/manager/manager.go` |
 | 核心业务逻辑 | `internal/core/campaigns.go` |
 | 数据库 Schema | `schema.sql` |
 | SQL 查询 | `queries/campaigns.sql`, `queries/links.sql` |
 | URL 配置 | `cmd/init.go` |
-| 模型定义 | `models/queries.go` |
+| 管理端 API | `cmd/campaigns.go` |
 
 ---
 
 ## 总结
 
-### 1. 设计亮点
+### 1. 修正的事实错误
+
+#### 1.1 像素尺寸
+
+| 错误描述 | 正确事实 |
+|---------|---------|
+| "3x14 像素"（含糊） | **14x3 像素（宽 x 高）** |
+| - | `drawTransparentImage(3, 14)` → h=3, w=14 |
+| - | `image.Rect(0, 0, 14, 3)` → 宽 14, 高 3 |
+
+#### 1.2 中间件链路
+
+| 错误描述 | 正确事实 |
+|---------|---------|
+| 追踪端点有 `hasSub` 中间件 | **追踪端点 NO `hasSub`** |
+| - | 像素追踪: `noIndex` → `hasUUID` → `RegisterCampaignView` |
+| - | 链接追踪: `noIndex` → `hasUUID` → `LinkRedirect` |
+| - | `hasSub` 只用于 `/subscription/...` 等订阅页面 |
+
+### 2. 设计亮点
 
 1. **失败安全 (Fail-Safe)**: 即使记录失败，也会返回像素图片或执行重定向，不影响用户体验
 2. **多层隐私控制**: 从全局禁用到匿名追踪再到个体追踪，灵活满足不同隐私需求
 3. **数据完整性**: 订阅者删除时保留匿名化统计数据（SET NULL），活动删除时清理相关记录（CASCADE）
 4. **缓存优化**: 链接注册使用内存缓存，避免重复数据库查询
-5. **智能统计**: 根据时间间隔自动选择聚合粒度（小时/天）
+5. **智能统计**: 根据时间间隔自动选择聚合粒度（小时/天），根据追踪模式选择计数方式（去重/普通）
 
-### 2. 隐私设计要点
+### 3. 隐私设计要点
 
 1. **Dummy UUID**: 模板预览时使用 `00000000-0000-0000-0000-000000000000`，避免污染统计数据
 2. **SET NULL 策略**: 订阅者删除后，记录中的 `subscriber_id` 置 NULL，保留历史统计但无法关联到具体个人
 3. **可选个体追踪**: 管理员可选择是否记录具体订阅者的行为
+4. **无 `hasSub` 中间件**: 追踪端点不验证订阅者存在，即使订阅者已删除，事件仍可匿名记录
 
-### 3. 技术要点
+### 4. 技术要点
 
 1. **307 重定向**: 保持原始 HTTP 方法，虽然链接点击通常是 GET
-2. **透明 PNG**: 3x14 像素，Go 标准库动态生成，无需外部文件
+2. **透明 PNG**: 14x3 像素（宽x高），Go 标准库动态生成，无需外部文件
 3. **Cache-Control: no-cache**: 防止浏览器缓存像素请求，确保每次打开都被记录
 4. **X-Robots-Tag: noindex**: 防止搜索引擎索引追踪端点
+5. **动态查询准备**: 启动时根据 `individual_tracking` 配置选择去重/普通计数查询
 
 ---
 
-*分析基于 listmonk 代码库，生成时间: 2026-05-05*
+*分析基于 listmonk 代码库，修订时间: 2026-05-05*
