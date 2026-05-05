@@ -913,9 +913,321 @@ WHERE
 </template>
 ```
 
-## 8. 未确认订阅的清理机制
+## 8. 失败分支分析
 
-### 8.1 清理功能入口
+### 8.1 确认邮件发送失败处理
+
+#### 8.1.1 核心控制参数：`assertOptin`
+
+listmonk 通过 `assertOptin` 参数控制确认邮件发送失败时的行为：
+
+**文件位置**: `internal/core/subscribers.go:338-346`
+
+```go
+// 检查并发送二次确认邮件
+hasOptin := false
+if !preconfirm && c.consts.SendOptinConfirmation {
+    // 调用钩子函数发送确认邮件
+    num, err := c.h.SendOptinConfirmation(out, listIDs)
+    
+    // 关键逻辑：根据 assertOptin 决定失败处理方式
+    if assertOptin && err != nil {
+        return out, hasOptin, err  // 强制要求：发送失败则返回错误
+    }
+
+    // 标记是否发送了确认邮件
+    hasOptin = num > 0
+}
+```
+
+#### 8.1.2 两种场景的不同行为
+
+| 场景 | `assertOptin` 值 | 邮件发送失败时的行为 | 订阅状态 |
+|------|------------------|----------------------|----------|
+| **公共订阅表单** | `true` | 返回错误给用户 | 订阅者已创建，但订阅流程中断 |
+| **管理后台创建** | `false` | 忽略错误，仅记录日志 | 保持 `unconfirmed` 状态 |
+
+#### 8.1.3 公共订阅表单的强制确认
+
+**文件位置**: `cmd/public.go:215-219`
+
+```go
+_, hasOptin, err := a.core.InsertSubscriber(models.Subscriber{
+    Name:   req.Name,
+    Email:  req.Email,
+    Status: models.SubscriberStatusEnabled,
+}, nil, listUUIDs, false, true)  // preconfirm=false, assertOptin=true
+```
+
+**行为分析**:
+1. 当 `assertOptin=true` 时，如果 SMTP 服务器不可用、邮件被拒绝等情况，**订阅会失败**
+2. 订阅者记录已经写入数据库（`subscribers` 表），但订阅关联（`subscriber_lists` 表）也已写入
+3. 用户看到错误提示，但数据可能处于不一致状态
+
+#### 8.1.4 管理后台的宽松模式
+
+**文件位置**: `cmd/subscribers.go:249-251`
+
+```go
+sub, _, err := a.core.InsertSubscriber(req.Subscriber, listIDs, nil, req.PreconfirmSubs, false)
+// assertOptin=false
+```
+
+**行为分析**:
+1. 当 `assertOptin=false` 时，邮件发送失败**不会中断订阅流程**
+2. 订阅状态保持 `unconfirmed`
+3. 管理员可以稍后通过"重发确认邮件"功能手动触发
+
+#### 8.1.5 手动重发确认邮件
+
+管理后台提供了重发确认邮件的功能：
+
+**文件位置**: `cmd/subscribers.go:375-396`
+
+```go
+// SubscriberSendOptin 手动发送确认邮件
+func (a *App) SubscriberSendOptin(c echo.Context) error {
+    // ... 权限检查和获取订阅者 ...
+    
+    // 触发确认邮件发送钩子
+    if _, err := a.fnOptinNotify(out, nil); err != nil {
+        return echo.NewHTTPError(http.StatusInternalServerError, 
+            a.i18n.T("subscribers.errorSendingOptin"))
+    }
+
+    return c.JSON(http.StatusOK, okResp{true})
+}
+```
+
+**API 路由**: `cmd/handlers.go:126`
+```go
+g.POST("/api/subscribers/:id/optin", pm(hasID(a.SubscriberSendOptin), "subscribers:manage"))
+```
+
+---
+
+### 8.2 重复点击确认链接处理
+
+#### 8.2.1 状态检查机制
+
+确认页面在处理前会先检查是否有需要确认的订阅：
+
+**文件位置**: `cmd/public.go:368-379`
+
+```go
+// 查询需要确认的订阅列表
+// 关键条件：只查询状态为 unconfirmed 的订阅
+lists, err := a.core.GetSubscriberLists(
+    0,                          // 不通过 ID 查找
+    subUUID,                    // 通过 UUID 查找
+    nil,                        // 不过滤列表 ID
+    req.ListUUIDs,              // 过滤列表 UUID（来自 URL 参数）
+    models.SubscriptionStatusUnconfirmed,  // ⚠️ 只查询未确认的
+    ""                          // 不过滤列表类型
+)
+
+// 如果没有需要确认的列表（可能已确认或链接无效）
+if len(lists) == 0 {
+    return c.Render(http.StatusOK, tplMessage,
+        makeMsgTpl(a.i18n.T("public.noSubTitle"), "", 
+            a.i18n.Ts("public.noSubInfo")))  // 显示友好提示，而非错误
+}
+```
+
+#### 8.2.2 场景分析
+
+| 场景 | 查询结果 | 用户看到的提示 |
+|------|----------|----------------|
+| **首次点击确认** | `len(lists) > 0` | 显示确认页面，列出待确认的列表 |
+| **已确认后再次点击** | `len(lists) == 0` | 显示"没有需要确认的订阅"友好提示 |
+| **链接中的列表 UUID 无效** | `len(lists) == 0` | 显示"没有需要确认的订阅" |
+| **订阅已被清理** | `len(lists) == 0` | 显示"没有需要确认的订阅" |
+
+#### 8.2.3 查询 SQL 详解
+
+**文件位置**: `queries/subscribers.sql:25-39`
+
+```sql
+-- name: get-subscriber-lists
+WITH sub AS (
+    SELECT id FROM subscribers WHERE CASE WHEN $1 > 0 THEN id = $1 ELSE uuid = $2 END
+)
+SELECT * FROM lists
+    LEFT JOIN subscriber_lists ON (lists.id = subscriber_lists.list_id)
+    WHERE subscriber_id = (SELECT id FROM sub)
+    -- 可选的列表 ID 或 UUID 过滤
+    AND (CASE WHEN CARDINALITY($3::INT[]) > 0 THEN id = ANY($3::INT[])
+          WHEN CARDINALITY($4::UUID[]) > 0 THEN uuid = ANY($4::UUID[])
+          ELSE TRUE
+    END)
+    -- ⚠️ 关键：按订阅状态过滤
+    AND (CASE WHEN $5 != '' THEN subscriber_lists.status = $5::subscription_status ELSE TRUE END)
+    -- 按列表 optin 类型过滤
+    AND (CASE WHEN $6 != '' THEN lists.optin = $6::list_optin ELSE TRUE END)
+    ORDER BY id;
+```
+
+**参数说明**:
+- `$5`: 订阅状态过滤，确认页面传入 `SubscriptionStatusUnconfirmed`
+- `$6`: 列表 optin 类型过滤，邮件发送时传入 `ListOptinDouble`
+
+---
+
+### 8.3 未确认订阅清理时的状态变化
+
+#### 8.3.1 清理 API 入口
+
+**文件位置**: `cmd/maintenance.go:41-58`
+
+```go
+// GCSubscriptions 清理未确认的订阅
+func (a *App) GCSubscriptions(c echo.Context) error {
+    // 解析截止日期参数（RFC3339 格式）
+    t, err := time.Parse(time.RFC3339, c.FormValue("before_date"))
+    if err != nil {
+        return echo.NewHTTPError(http.StatusBadRequest, 
+            a.i18n.T("globals.messages.invalidData"))
+    }
+
+    // 执行清理
+    n, err := a.core.DeleteUnconfirmedSubscriptions(t)
+    if err != nil {
+        return err
+    }
+
+    return c.JSON(http.StatusOK, okResp{struct {
+        Count int `json:"count"
+    }{n}})  // 返回被清理的订阅数量
+}
+```
+
+**核心实现**: `internal/core/subscriptions.go:110-122`
+
+```go
+func (c *Core) DeleteUnconfirmedSubscriptions(beforeDate time.Time) (int, error) {
+    res, err := c.q.DeleteUnconfirmedSubscriptions.Exec(beforeDate)
+    if err != nil {
+        c.log.Printf("error deleting unconfirmed subscribers: %v", err)
+        return 0, echo.NewHTTPError(http.StatusInternalServerError,
+            c.i18n.Ts("globals.messages.errorDeleting", 
+                "name", "{globals.terms.subscribers}", "error", pqErrMsg(err)))
+    }
+
+    n, _ := res.RowsAffected()
+    return int(n), nil
+}
+```
+
+#### 8.3.2 清理 SQL 逻辑详解
+
+**文件位置**: `queries/subscribers.sql:269-274`
+
+```sql
+-- name: delete-unconfirmed-subscriptions
+WITH optins AS (
+    -- 1. 找出所有配置为 double opt-in 的列表
+    SELECT id FROM lists WHERE optin = 'double'
+)
+-- 2. 删除这些列表中超过指定时间的未确认订阅
+DELETE FROM subscriber_lists
+WHERE 
+    status = 'unconfirmed'          -- 条件1：只删除未确认的订阅
+    AND list_id IN (SELECT id FROM optins)  -- 条件2：只针对 double opt-in 列表
+    AND created_at < $1;            -- 条件3：创建时间早于指定日期
+```
+
+#### 8.3.3 数据状态变化
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        未确认订阅清理前后状态对比                              │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  清理前:                                                                     │
+│  ┌──────────────┐         ┌──────────────────┐         ┌──────────────┐   │
+│  │ subscribers  │         │ subscriber_lists │         │    lists     │   │
+│  ├──────────────┤         ├──────────────────┤         ├──────────────┤   │
+│  │ id: 1        │◀────────│ subscriber_id: 1 │────────▶│ id: 1        │   │
+│  │ email: a@b.c │         │ list_id: 1       │         │ optin: double│   │
+│  │ status:enabled│         │ status: unconfirm│         │              │   │
+│  └──────────────┘         │ created_at: ...  │         └──────────────┘   │
+│                           └──────────────────┘                              │
+│                                                                              │
+│  清理后 (执行 DELETE FROM subscriber_lists ...):                            │
+│  ┌──────────────┐         ┌──────────────────┐         ┌──────────────┐   │
+│  │ subscribers  │         │ subscriber_lists │         │    lists     │   │
+│  ├──────────────┤         ├──────────────────┤         ├──────────────┤   │
+│  │ id: 1        │         │   (记录已删除)   │         │ id: 1        │   │
+│  │ email: a@b.c │         │                  │         │ optin: double│   │
+│  │ status:enabled│         │                  │         │              │   │
+│  └──────────────┘         └──────────────────┘         └──────────────┘   │
+│       │                                                                      │
+│       │  成为"孤儿订阅者"（没有任何列表订阅）                                │
+│       ▼                                                                      │
+│  可通过 DeleteOrphanSubscribers 进一步清理                                   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 8.3.4 清理后的状态总结
+
+| 数据表 | 清理操作 | 状态变化 |
+|--------|----------|----------|
+| `subscribers` (订阅者主表) | **不删除** | 保持不变，仍为 `enabled` |
+| `subscriber_lists` (订阅关联表) | **删除** | 符合条件的记录被物理删除 |
+| `lists` (列表主表) | **不影响** | 保持不变 |
+
+#### 8.3.5 孤儿订阅者的进一步清理
+
+如果清理后订阅者没有任何订阅，可以通过以下 API 清理：
+
+**文件位置**: `cmd/maintenance.go:14-39`
+
+```go
+// GCSubscribers 清理孤儿订阅者或拉黑的订阅者
+func (a *App) GCSubscribers(c echo.Context) error {
+    var (
+        typ = c.Param("type")
+        n   int
+        err error
+    )
+
+    switch typ {
+    case "blocklisted":
+        n, err = a.core.DeleteBlocklistedSubscribers()  // 删除拉黑的订阅者
+    case "orphan":
+        n, err = a.core.DeleteOrphanSubscribers()       // 删除孤儿订阅者（无任何订阅）
+    default:
+        err = echo.NewHTTPError(http.StatusBadRequest, 
+            a.i18n.T("globals.messages.invalidData"))
+    }
+    // ...
+}
+```
+
+**孤儿订阅者删除 SQL**: `queries/subscribers.sql:210-212`
+```sql
+-- name: delete-orphan-subscribers
+DELETE FROM subscribers a WHERE NOT EXISTS
+    (SELECT 1 FROM subscriber_lists b WHERE b.subscriber_id = a.id);
+```
+
+---
+
+### 8.4 失败场景汇总表
+
+| 失败场景 | 触发条件 | 行为 | 数据状态 | 恢复方式 |
+|----------|----------|------|----------|----------|
+| **确认邮件发送失败（公共表单）** | SMTP 错误、邮件被拒收等 | 返回错误给用户 | 订阅者已创建，订阅关联已创建（unconfirmed） | 管理员后台重发确认邮件 |
+| **确认邮件发送失败（管理后台）** | 同上 | 忽略错误，继续流程 | 订阅保持 unconfirmed 状态 | 管理员后台重发确认邮件 |
+| **重复点击确认链接** | 用户多次点击邮件链接 | 显示友好提示"无需要确认的订阅" | 数据无变化 | 无需处理 |
+| **确认链接过期** | 超过配置的有效期（如果有） | 同重复点击 | 数据可能已被清理 | 重新订阅 |
+| **未确认订阅被清理** | 管理员执行清理操作 | 物理删除订阅关联 | subscriber_lists 记录被删除 | 重新订阅 |
+| **孤儿订阅者** | 所有订阅都被清理后 | 可被单独清理 | subscribers 记录被删除 | 重新订阅 |
+
+## 9. 未确认订阅的清理机制
+
+### 9.1 清理功能入口
 
 **文件位置**: `cmd/handlers.go:195`
 
@@ -925,7 +1237,7 @@ g.DELETE("/api/maintenance/subscriptions/unconfirmed",
     pm(a.GCSubscriptions, "settings:maintain"))
 ```
 
-### 8.2 清理 SQL 逻辑
+### 9.2 清理 SQL 逻辑
 
 **文件位置**: `queries/subscribers.sql:269-274`
 
@@ -948,7 +1260,7 @@ WHERE
 2. 基于 `created_at` 时间判断是否过期
 3. 保留其他类型列表的未确认订阅
 
-## 9. 列表 Opt-in 类型配置
+## 10. 列表 Opt-in 类型配置
 
 ### 9.1 列表类型定义
 
