@@ -166,11 +166,180 @@ func (a *App) GetCampaignArchivesFeed(c echo.Context) error {
 
 订阅者自助门户允许订阅者通过邮件中的链接访问个人订阅管理页面，进行退订、偏好管理、数据导出/删除等操作。
 
-### 3.1 访问鉴权机制
+### 3.1 访问令牌结构与权限边界
+
+订阅者自助门户的访问链接包含两种标识：
+
+| 标识类型 | 参数名 | 来源 | 权限范围 |
+|---------|-------|------|---------|
+| 活动标识 | `campUUID` | 邮件 Campaign 的 UUID | 标识该链接来自哪封邮件 |
+| 订阅者标识 | `subUUID` | 订阅者的 UUID | **核心访问令牌，决定访问权限** |
+
+#### 3.1.1 两种标识的关联校验位置
+
+**关键发现**：`campUUID` 和 `subUUID` 的关联校验**仅在特定操作中进行**，在大多数页面中 `campUUID` 并不作为权限校验的依据。
+
+**路由中的标识使用情况**：
+
+| 路由 | 标识参数 | 关联校验位置 | 校验强度 |
+|-----|---------|-------------|---------|
+| `GET /subscription/:campUUID/:subUUID` | campUUID + subUUID | **无关联校验** | campUUID 被忽略 |
+| `POST /subscription/:campUUID/:subUUID` | campUUID + subUUID | SQL 层面（简单退订时） | 仅简单退订时使用 |
+| `GET /campaign/:campUUID/:subUUID` | campUUID + subUUID | **无关联校验** | 各自独立验证存在性 |
+| `GET/POST /subscription/optin/:subUUID` | 仅 subUUID | 无 campUUID | 不涉及 |
+| `POST /subscription/export/:subUUID` | 仅 subUUID | 无 campUUID | 不涉及 |
+| `POST /subscription/wipe/:subUUID` | 仅 subUUID | 无 campUUID | 不涉及 |
+
+**1. 订阅管理页面（GET）- 无关联校验**
+
+```go
+// cmd/public.go:197-208
+func (a *App) SubscriptionPage(c echo.Context) error {
+    var (
+        subUUID       = c.Param("subUUID")  // 只获取 subUUID
+        showManage, _ = strconv.ParseBool(c.FormValue("manage"))
+    )
+
+    // Get the subscriber from the DB.
+    s, err := a.core.GetSubscriber(0, subUUID, "")  // 只使用 subUUID
+    // campUUID 完全没有被使用！
+    // ...
+}
+```
+
+**代码位置**：`cmd/public.go:197-248`
+
+**安全影响**：
+- 只要持有有效的 `subUUID`，无论 `campUUID` 是否正确、是否存在，都可以访问订阅管理页面
+- `campUUID` 在 GET 请求中只是一个"占位符"，不参与任何权限校验
+
+**2. 订阅偏好更新（POST）- 部分关联校验**
+
+```go
+// cmd/public.go:266-280
+func (a *App) SubscriptionPrefs(c echo.Context) error {
+    var (
+        campUUID  = c.Param("campUUID")
+        subUUID   = c.Param("subUUID")
+        blocklist = a.cfg.Privacy.AllowBlocklist && req.Blocklist
+    )
+    
+    // 简单退订或加入黑名单时
+    if !req.Manage || blocklist {
+        // 这里使用了 campUUID
+        if err := a.core.UnsubscribeByCampaign(subUUID, campUUID, blocklist); err != nil {
+            // ...
+        }
+        // ...
+    }
+    
+    // 偏好管理时（manage=true）
+    // ... 完全不使用 campUUID ...
+}
+```
+
+**SQL 层面的关联校验**（简单退订时）：
+
+```sql
+-- queries/subscribers.sql:251-267
+-- name: unsubscribe-by-campaign
+WITH lists AS (
+    SELECT list_id FROM campaign_lists
+    LEFT JOIN campaigns ON (campaign_lists.campaign_id = campaigns.id)
+    WHERE campaigns.uuid = $1  -- campUUID
+),
+sub AS (
+    UPDATE subscribers SET status = (CASE WHEN $3 IS TRUE THEN 'blocklisted' ELSE status END)
+    WHERE uuid = $2 RETURNING id  -- subUUID
+)
+UPDATE subscriber_lists SET status = 'unsubscribed', updated_at=NOW() WHERE
+    subscriber_id = (SELECT id FROM sub) AND status != 'unsubscribed' AND
+    -- 关键：如果不是 blocklist，只退订该 campaign 的列表
+    CASE WHEN $3 IS FALSE THEN list_id = ANY(SELECT list_id FROM lists) ELSE list_id != 0 END;
+```
+
+**校验逻辑分析**：
+1. `lists` CTE：根据 `campUUID` 查找该 Campaign 关联的所有列表
+2. `sub` CTE：根据 `subUUID` 查找订阅者（blocklist 时更新状态）
+3. 最终 UPDATE：
+   - 如果是 **blocklist=true**：退订该订阅者的**所有列表**（不限制于该 Campaign）
+   - 如果是 **blocklist=false**：只退订该订阅者在**该 Campaign 列表**中的订阅
+
+**安全影响**：
+- 简单退订时：`campUUID` 用于确定要退订哪些列表
+- 但即使 `campUUID` 对应的 Campaign 不存在或不属于该订阅者，SQL 仍然会执行（只是 `lists` CTE 可能返回空，退订操作不生效）
+- 偏好管理时（`manage=true`）：完全不使用 `campUUID`
+
+**3. 邮件查看页面 - 无关联校验**
+
+```go
+// cmd/public.go:148-193
+func (a *App) ViewCampaignMessage(c echo.Context) error {
+    // 1. 验证 campaign 存在
+    campUUID := c.Param("campUUID")
+    camp, err := a.core.GetCampaign(0, campUUID, "")
+    if err != nil {
+        // 返回 404
+    }
+
+    // 2. 验证 subscriber 存在
+    subUUID := c.Param("subUUID")
+    sub, err := a.core.GetSubscriber(0, subUUID, "")
+    if err != nil {
+        // 返回 404
+    }
+
+    // 3. 使用两者渲染邮件 - 但没有验证该订阅者是否是该 Campaign 的受众！
+    msg, err := a.manager.NewCampaignMessage(&camp, sub)
+    // ...
+}
+```
+
+**代码位置**：`cmd/public.go:148-193`
+
+**安全影响**：
+- 如果攻击者持有一个有效的 `subUUID`，可以尝试不同的 `campUUID`
+- 只要两个 UUID 都存在，就可以查看发送给该订阅者的**任意邮件**
+- 没有验证该订阅者是否真的是该 Campaign 的目标受众
+
+#### 3.1.2 关联校验缺失的风险场景
+
+**场景 1：链接泄露后的横向访问**
+
+假设订阅者 A 的退订链接泄露：
+- 链接：`/subscription/campaign-A-uuid/subscriber-A-uuid`
+
+攻击者可以：
+1. 访问 `/subscription/any-valid-campaign-uuid/subscriber-A-uuid` → **成功访问 A 的管理页面**
+2. 访问 `/campaign/campaign-B-uuid/subscriber-A-uuid` → **成功查看发送给 A 的 Campaign B 邮件**（如果 B 存在）
+3. 访问 `/subscription/optin/subscriber-A-uuid` → **查看 A 的未确认订阅**
+4. POST 到 `/subscription/export/subscriber-A-uuid` → **导出 A 的所有数据**
+5. POST 到 `/subscription/wipe/subscriber-A-uuid` → **删除 A 的所有数据**
+
+**场景 2：campUUID 伪造**
+
+攻击者持有 `subUUID: 11111111-1111-1111-1111-111111111111`
+
+可以尝试：
+```
+GET /subscription/00000000-0000-0000-0000-000000000000/11111111-1111-1111-1111-111111111111
+```
+
+- 如果 `campUUID` 格式正确但不存在：
+  - `hasUUID` 中间件通过（格式正确）
+  - `hasSub` 中间件通过（subUUID 存在）
+  - `SubscriptionPage` 成功执行（不使用 campUUID）
+  - **结果：成功访问订阅管理页面**
+
+- 如果 `campUUID` 格式错误：
+  - `hasUUID` 中间件返回 400 Bad Request
+  - **结果：拒绝访问**
+
+### 3.2 访问鉴权机制
 
 订阅者门户采用**中间件链（Middleware Chain）**的方式进行访问验证。
 
-#### 3.1.1 路由定义与中间件链
+#### 3.2.1 路由定义与中间件链
 
 ```go
 // cmd/handlers.go:271-279
