@@ -1017,3 +1017,980 @@ WHEN $6 = 'api'
    - 定期检查 API 用户列表
    - 监控异常 API 调用
    - 及时撤销不再使用的 API Token
+
+---
+
+## 十、高风险冲突场景分析
+
+### 10.1 问题描述
+
+**核心问题：当请求同时携带**：
+1. **过期或无效的 `session` Cookie
+2. **有效的** `Authorization` 鉴权头
+
+**当前行为**：中间件返回 `"invalid session"` 错误，**不会回退到 API Token 验证。
+
+**预期行为**：当 Session 无效时，应该尝试使用有效的 API Token。
+
+---
+
+### 10.2 当前中间件逻辑详细分析
+
+#### 10.2.1 完整执行流程
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    当前 Auth.Middleware 执行流程                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  请求携带：                                                                  │
+│  Cookie: session=expired_token_invalid                                     │
+│  Authorization: token myapi:valid_token_123                                │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 步骤 1: 获取 Authorization 头                                       │   │
+│  │ hdr = "token myapi:valid_token_123"                                │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│         │                                                                     │
+│         ▼                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 步骤 2: 检查 Cookie 中是否有 "session="                             │   │
+│  │                                                                      │   │
+│  │ if strings.Contains(cookie, "session=") {                           │   │
+│  │     hdr = ""  // ⚠️ 清空 Authorization 头！                         │   │
+│  │ }                                                                    │   │
+│  │                                                                      │   │
+│  │ 结果：hdr = "" (即使 session 已过期/无效！)                          │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│         │                                                                     │
+│         ▼                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 步骤 3: 检查 hdr 是否为空                                           │   │
+│  │                                                                      │   │
+│  │ if len(hdr) > 0 {     // hdr 现在是空的，跳过这一步              │   │
+│  │     // 尝试 API Token 验证（永远不会执行！）                         │   │
+│  │ }                                                                    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│         │                                                                     │
+│         ▼                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 步骤 4: 尝试会话验证（唯一路径！）                                     │   │
+│  │                                                                      │   │
+│  │ sess, user, err := o.validateSession(c)                            │   │
+│  │                                                                      │   │
+│  │ // validateSession 内部：                                             │   │
+│  │ sess, err := o.sess.Acquire(...)      // 尝试从数据库获取会话      │   │
+│  │                                                                      │   │
+│  │ // 结果：err != nil（session 不存在或已过期）                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│         │                                                                     │
+│         ▼                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 步骤 5: 设置错误并返回                                               │   │
+│  │                                                                      │   │
+│  │ c.Set(UserHTTPCtxKey, echo.NewHTTPError(                          │   │
+│  │     http.StatusForbidden, "invalid session"  // ⚠️ 误导性错误！  │   │
+│  │ ))                                                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  最终结果：                                                                  │
+│  - 有效的 API Token 被完全忽略                                               │
+│  - 返回 "invalid session" 错误（不是 "invalid API credentials"）            │
+│  - 用户/开发者困惑：为什么带了正确的 Token 还被拒绝？                        │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 10.2.2 关键代码位置
+
+**问题代码**（`internal/auth/auth.go:282-333`）：
+
+```go
+func (o *Auth) Middleware(next echo.HandlerFunc) echo.HandlerFunc {
+    return func(c echo.Context) error {
+        // 步骤 1: 获取 Authorization 头
+        hdr := strings.TrimSpace(c.Request().Header.Get("Authorization"))
+
+        // 步骤 2: ⚠️ 问题所在！
+        // 如果有 session Cookie，无条件清空 Authorization 头
+        // 不检查 session 是否有效！
+        if c := strings.TrimSpace(c.Request().Header.Get("Cookie")); strings.Contains(c, "session=") {
+            hdr = ""  // 清空！
+        }
+
+        // 步骤 3: 尝试 API Token 验证（只有 hdr 非空时执行）
+        if len(hdr) > 0 {
+            key, token, err := parseAuthHeader(hdr)
+            // ... 验证 API Token
+        }
+
+        // 步骤 4: 尝试会话验证（唯一可能的路径）
+        sess, user, err := o.validateSession(c)
+        if err != nil {
+            // 步骤 5: 返回会话错误
+            c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, "invalid session"))
+            return next(c)
+        }
+        // ...
+    }
+}
+```
+
+---
+
+### 10.3 真实触发场景
+
+#### 场景 1：开发人员混用浏览器和 API 工具
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  时间线                                                                        │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  Day 1:                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 开发人员用浏览器登录管理界面                                            │   │
+│  │                                                                      │   │
+│  │ 1. POST /admin/login (username=admin, password=secret)            │   │
+│  │ 2. 响应 Set-Cookie: session=valid_session_abc123; Max-Age=604800  │   │
+│  │ 3. 浏览器保存 Cookie 7 天                                           │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  Day 8: (7 天后)                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ Session 已过期，但浏览器仍在发送 Cookie！                               │   │
+│  │                                                                      │   │
+│  │ Cookie: session=valid_session_abc123 (已过期，数据库中已不存在)    │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  同一时刻：                                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 开发人员用 Postman 测试 API，配置了有效的 API Token                  │   │
+│  │                                                                      │   │
+│  │ 但是！Postman 运行在同一浏览器中（Chrome 扩展）                     │   │
+│  │ 或者：开发人员从浏览器复制 Cookie 到 Postman 调试                   │   │
+│  │                                                                      │   │
+│  │ 实际发送的请求：                                                    │   │
+│  │ GET /api/lists                                                      │   │
+│  │ Cookie: session=valid_session_abc123 (已过期)                    │   │
+│  │ Authorization: token myapi:valid_token_123 (有效)                       │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  结果：                                                                      │
+│  - Authorization 头被清空                                                          │
+│  - 会话验证失败                                                              │
+│  - 返回 "invalid session" 错误                                             │
+│  - 开发人员困惑：为什么带了正确的 Token 还被拒绝？                          │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 场景 2：浏览器扩展调用 API
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  场景：用户同时使用：                                                       │
+│  1. 浏览器中的 Listmonk 管理界面（有 session Cookie）                       │
+│  2. 第三方浏览器扩展（配置了 API Token）                                   │
+│                                                                             │
+│  问题：                                                                      │
+│  - 扩展发起 API 请求时：                                                    │
+│    - 浏览器自动附带所有 Cookie（包括 session）                               │
+│    - 扩展同时设置 Authorization 头                                          │
+│                                                                             │
+│  时间线：                                                                    │
+│  ┌─────────────────────────────────────────────────────────────────────┐ │
+│  │ 1. 用户在浏览器中访问 Listmonk 管理界面                                │ │
+│  │    → 获得 session Cookie                                              │ │
+│  │                                                                      │ │
+│  │ 2. 用户安装浏览器扩展，配置 API Token                                 │ │
+│  │    扩展代码：                                                         │ │
+│  │    fetch('https://listmonk.example.com/api/lists', {               │ │
+│  │      headers: {                                                       │ │
+│  │        'Authorization': 'token myext:valid_token'                   │ │
+│  │      }                                                                │ │
+│  │    })                                                                 │ │
+│  │                                                                      │ │
+│  │ 3. 浏览器实际发送的请求：                                             │ │
+│  │    GET /api/lists                                                    │ │
+│  │    Cookie: session=abc123... (来自管理界面)                         │ │
+│  │    Authorization: token myext:valid_token (来自扩展)                 │ │
+│  │                                                                      │ │
+│  │ 4. 服务器处理：                                                        │ │
+│  │    - 检测到 session Cookie → 清空 Authorization 头                  │ │
+│  │    - 尝试验证 session → 可能过期/无效                                │ │
+│  │    - 返回 "invalid session"                                           │ │
+│  └─────────────────────────────────────────────────────────────────────┘ │
+│                                                                             │
+│  结果：扩展无法正常工作，用户困惑为什么配置了正确的 Token                    │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 场景 3：嵌入式 iframe / 微前端
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  架构：                                                                      │
+│  - 主应用（Portal）使用 session Cookie 认证                                │
+│  - Listmonk 作为微前端嵌入在 iframe 中，使用 API Token                     │
+│                                                                             │
+│  问题：                                                                      │
+│  - 主应用的 Cookie 会被发送到 iframe 中的请求                              │
+│  - 即使 iframe 设置了 Authorization 头                                      │
+│                                                                             │
+│  请求流程：                                                                  │
+│  主应用 (Portal)                                                             │
+│       │                                                                     │
+│       │ Set-Cookie: session=portal_session...                             │
+│       ▼                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  iframe (Listmonk 微前端)                                         │   │
+│  │                                                                      │   │
+│  │  发起 API 请求：                                                    │   │
+│  │  GET /api/lists                                                      │   │
+│  │  Cookie: session=portal_session... (来自父级，对 Listmonk 无效)   │   │
+│  │  Authorization: token microfrontend:valid_token (iframe 设置)      │   │
+│  │                                                                      │   │
+│  │  结果：                                                               │   │
+│  │  - 服务器检测到 session Cookie (虽然是其他应用的)                   │   │
+│  │  - 清空 Authorization 头                                             │   │
+│  │  - 尝试验证 session → 失败                                           │   │
+│  │  - 返回 "invalid session"                                            │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 10.4 影响面分析
+
+| 影响维度 | 描述 | 严重程度 |
+|---------|------|---------|
+| **可用性** | 合法的 API 请求被错误拒绝 | **高** |
+| **可调试性** | 错误信息误导（"invalid session" 而非 "invalid API credentials"） | **高** |
+| **用户体验** | 用户/开发者困惑：为什么带了正确的 Token 还被拒绝？ | **中** |
+| **安全性** | 无直接安全问题，但可能导致不当 workaround | **低** |
+
+#### 具体影响场景
+
+1. **开发环境**：
+   - 开发人员调试 API 时困惑
+   - 浪费时间排查问题
+   - 可能导致开发者使用不当的 workaround（如手动清除 Cookie）
+
+2. **生产环境**：
+   - 浏览器扩展无法正常工作
+   - 微前端架构集成失败
+   - 自动化脚本在特定条件下失败
+
+3. **升级场景**：
+   - v3 -> v4 升级后，用户可能同时有：
+     - 旧的 Basic Auth 凭证（浏览器保存）
+     - 新的 Session Cookie
+     - 新的 API Token（用于自动化）
+   - 这可能导致复杂的交互问题
+
+---
+
+### 10.5 最小可复现请求示例
+
+#### 前置条件
+
+1. 创建一个 API 用户并获取 Token：
+   ```http
+   POST /api/users
+   Authorization: token admin:admin_password
+   Content-Type: application/json
+   
+   {
+     "username": "testapi",
+     "name": "Test API User",
+     "type": "api",
+     "user_role_id": 1
+   }
+   
+   响应：
+   {
+     "data": {
+       "id": 5,
+       "username": "testapi",
+       "password": "abc123def456valid"  // 保存这个 Token
+     }
+   }
+   ```
+
+2. 确认 API Token 单独有效：
+   ```bash
+   curl http://localhost:9000/api/lists \
+     -H "Authorization: token testapi:abc123def456valid"
+   # 应该返回 200 OK
+   ```
+
+#### 可复现请求
+
+```bash
+# 场景：同时携带无效 session Cookie 和有效 API Token
+
+# 使用 curl 模拟：
+curl -v http://localhost:9000/api/lists \
+  -H "Cookie: session=this_is_an_invalid_session_token_that_does_not_exist_in_db" \
+  -H "Authorization: token testapi:abc123def456valid" \
+  -H "Accept: application/json"
+```
+
+**预期行为**（应该使用有效的 API Token，返回 200 OK。
+
+**实际行为**（当前代码）：返回 403 Forbidden。
+
+#### 不同场景测试
+
+```bash
+# 场景 1: 只有有效 API Token（应该成功）
+curl http://localhost:9000/api/lists \
+  -H "Authorization: token testapi:abc123def456valid"
+# ✅ 预期：200 OK
+# ✅ 实际：200 OK
+
+# 场景 2: 只有无效 session Cookie（应该失败）
+curl http://localhost:9000/api/lists \
+  -H "Cookie: session=invalid_session"
+# ✅ 预期：403
+# ✅ 实际：403
+
+# 场景 3: 无效 session Cookie + 有效 API Token（BUG！）
+curl http://localhost:9000/api/lists \
+  -H "Cookie: session=invalid_session" \
+  -H "Authorization: token testapi:abc123def456valid"
+# ❌ 预期：200 OK（应该使用有效的 API Token）
+# ❌ 实际：403 Forbidden（返回 "invalid session"）
+```
+
+---
+
+### 10.6 v3->v4 兼容意图的深入分析
+
+#### 原始兼容问题
+
+从代码注释（`internal/auth/auth.go:291-297`）：
+
+```
+// If cookie is set, ignore BasicAuth. This is to preserve backwards compatibility
+// in v3 -> v4 upgrade where the user browser sessions would still have old
+// BasicAuth credentials, which no longer work in the new system which expects
+// session cookies instead, which causes a redirect loop despite loggin in and session
+// cookies being set.
+```
+
+#### v3 vs v4 认证机制对比
+
+| 版本 | 认证机制 | 说明 |
+|------|---------|------|
+| **v3** | HTTP Basic Auth | 浏览器保存用户名密码，每次请求自动发送 |
+| **v4** | Session Cookie | 登录后获得 Cookie，7 天过期 |
+
+#### v3->v4 升级时的问题场景
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│  v3 -> v4 升级时的问题场景                                                     │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  v3 时代：                                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 用户访问管理界面                                                        │   │
+│  │ 1. 浏览器弹出 Basic Auth 对话框                                       │   │
+│  │ 2. 用户输入 admin / secret                                           │   │
+│  │ 3. 浏览器保存这些凭证，每次请求自动发送                                │   │
+│  │                                                                      │   │
+│  │ 每次请求：                                                          │   │
+│  │ GET /admin                                                          │   │
+│  │ Authorization: Basic YWRtaW46c2VjcmV0 (base64(admin:secret))        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  升级到 v4 后：                                                              │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 用户用新的 Session Cookie 机制登录                                       │   │
+│  │                                                                      │   │
+│  │ 1. POST /admin/login (username=admin, password=secret)            │   │
+│  │ 2. 响应 Set-Cookie: session=new_session_abc123                     │   │
+│  │                                                                      │   │
+│  │ 问题！浏览器仍然保存着旧的 Basic Auth 凭证！                          │   │
+│  │                                                                      │   │
+│  │ 后续请求：                                                          │   │
+│  │ GET /admin                                                          │   │
+│  │ Cookie: session=new_session_abc123 (新的，有效)                       │   │
+│  │ Authorization: Basic YWRtaW46c2VjcmV0 (旧的，v4 不再使用)        │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  v4 中间件处理（如果没有兼容逻辑）：                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 1. 检测到 Authorization 头（Basic Auth）                               │   │
+│  │ 2. 尝试验证 API Token                                             │   │
+│  │ 3. Basic Auth 格式的用户可能：                                           │   │
+│  │    - v3: admin 用户现在需要 bcrypt 哈希验证                               │   │
+│  │    - v4: API 用户需要明文比较                                      │   │
+│  │ 4. 验证失败（可能失败或行为异常）                                      │   │
+│  │ 5. 返回 403 错误                                                   │   │
+│  │ 6. 管理界面中间件看到 403 → 重定向到登录页                         │   │
+│  │ 7. 用户已经登录了！又被重定向到登录页 → 重定向循环！                  │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+│  这就是为什么需要兼容逻辑：                                                 │
+│  - 如果有 session Cookie，忽略 Authorization 头                              │
+│  - 避免重定向循环                                                           │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+#### 兼容逻辑的关键假设
+
+**原始设计假设**：
+- 如果有 session Cookie → 用户已经通过 v4 机制登录
+- 应该优先使用 session Cookie
+- 忽略 Authorization 头（可能是旧的 Basic Auth 凭证）
+
+**这个假设的问题**：
+- ❌ session Cookie 可能是**无效的/过期的**
+- ❌ Authorization 头可能是**有效的 API Token**（不是旧的 Basic Auth）
+- ❌ 没有回退机制
+
+#### 需要区分的两种情况
+
+| 情况 | Authorization 头类型 | 应该忽略？ |
+|------|------------------|---------|
+| A | 旧的 Basic Auth（v3 遗留）| ✅ 应该忽略（有有效 session 时） |
+| B | 新的 Token 格式（`token user:token`）| ❌ 不应该忽略（应该作为回退） |
+
+**关键洞察**：
+- v3->v4 兼容只需要忽略 **Basic Auth** 格式
+- **Token 格式**是 v4 的新格式，应该被尊重
+
+---
+
+### 10.7 改进方案设计
+
+#### 方案评估标准
+
+任何改进方案必须满足：
+
+| 标准 | 说明 |
+|------|------|
+| **不破坏 v3->v4 兼容** | 有有效 session Cookie + 旧 Basic Auth → 使用 session |
+| **修复当前问题** | 有无效 session Cookie + 有效 API Token → 使用 API Token |
+| **保持现有行为** | 无 session Cookie → 优先 API Token，然后 session |
+| **错误信息准确** | 哪种认证方式失败，返回对应错误信息 |
+
+#### 方案 1：最简修复 - 会话失败后回退
+
+**核心思想**：
+- 保持现有优先顺序（有 session Cookie 时优先尝试 session）
+- 但 session 验证**失败后**，回退尝试 API Token
+
+**修改后的逻辑流程**：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    改进后的 Auth.Middleware 执行流程                          │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                             │
+│  请求携带：                                                                  │
+│  Cookie: session=expired_invalid                                              │
+│  Authorization: token myapi:valid_token_123                                │
+│                                                                             │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 步骤 1: 保存原始 Authorization 头（用于可能的回退）                  │   │
+│  │ originalHdr = "token myapi:valid_token_123"                      │   │
+│  │                                                                      │   │
+│  │ 步骤 2: 检查是否有 session Cookie                                    │   │
+│  │ hasSessionCookie = true                                             │   │
+│  │                                                                      │   │
+│  │ 步骤 3: 有 session Cookie 时，优先尝试 session                      │   │
+│  │                                                                      │   │
+│  │ sess, user, err := o.validateSession(c)                              │   │
+│  │                                                                      │   │
+│  │ 分支 A: session 有效（v3->v4 兼容场景）                               │   │
+│  │ ┌─────────────────────────────────────────────────────────────┐   │
+│  │ │ if err == nil {                                               │   │
+│  │ │   // session 有效，使用它                                        │   │
+│  │ │   c.Set(UserHTTPCtxKey, user)                                  │   │
+│  │ │   // ✅ 保持 v3->v4 兼容                                       │   │
+│  │ │   return next(c)                                               │   │
+│  │ │ }                                                              │   │
+│  └─┴─────────────────────────────────────────────────────────────────┘   │
+│         │                                                                     │
+│         │ session 无效（err != nil）                                          │
+│         ▼                                                                     │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │ 步骤 4: session 无效，回退尝试 API Token（新增！）                    │   │
+│  │                                                                      │   │
+│  │ if len(originalHdr) > 0 {                                          │   │
+│  │     key, token, err := parseAuthHeader(originalHdr)              │   │
+│  │     if err == nil {                                                │   │
+│  │         user, ok := o.GetAPIToken(key, token)                     │   │
+│  │         if ok {                                                     │   │
+│  │             // API Token 有效！使用它                               │   │
+│  │             c.Set(UserHTTPCtxKey, user)                            │   │
+│  │             return next(c)                                           │   │
+│  │         }                                                            │   │
+│  │     }                                                                │   │
+│  │ }                                                                    │   │
+│  │                                                                      │   │
+│  │ // 两种方式都失败                                                    │   │
+│  │ c.Set(UserHTTPCtxKey, echo.NewHTTPError(                            │   │
+│  │     http.StatusForbidden, "invalid session or API credentials"       │   │
+│  │ ))                                                                   │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                             │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+**代码实现**：
+
+```go
+func (o *Auth) Middleware(next echo.HandlerFunc) echo.HandlerFunc {
+    return func(c echo.Context) error {
+        // 保存原始 Authorization 头，用于可能的回退
+        originalHdr := strings.TrimSpace(c.Request().Header.Get("Authorization"))
+
+        // 检查是否有 session Cookie
+        hasSessionCookie := strings.Contains(
+            strings.TrimSpace(c.Request().Header.Get("Cookie")),
+            "session=",
+        )
+
+        // ============================================
+        // 决策逻辑：
+        // - 有 session Cookie：先尝试 session，失败后回退到 API Token
+        // - 无 session Cookie：先尝试 API Token，失败后尝试 session
+        // ============================================
+
+        if hasSessionCookie {
+            // 有 session Cookie：优先尝试 session（保持 v3->v4 兼容）
+            sess, user, sessErr := o.validateSession(c)
+            if sessErr == nil {
+                // session 有效，使用它
+                c.Set(UserHTTPCtxKey, user)
+                c.Set(SessionKey, sess)
+                return next(c)
+            }
+
+            // session 无效，回退尝试 API Token（如果有）
+            if len(originalHdr) > 0 {
+                key, token, err := parseAuthHeader(originalHdr)
+                if err == nil {
+                    apiUser, ok := o.GetAPIToken(key, token)
+                    if ok {
+                        // API Token 有效，使用它
+                        c.Set(UserHTTPCtxKey, apiUser)
+                        return next(c)
+                    }
+                }
+            }
+
+            // 两种方式都失败
+            c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, "invalid session or API credentials"))
+            return next(c)
+        }
+
+        // 无 session Cookie：保持原有行为
+        // 先尝试 API Token，再尝试 session
+
+        if len(originalHdr) > 0 {
+            key, token, err := parseAuthHeader(originalHdr)
+            if err != nil {
+                c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, err.Error()))
+                return next(c)
+            }
+
+            user, ok := o.GetAPIToken(key, token)
+            if !ok {
+                c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, "invalid API credentials"))
+                return next(c)
+            }
+
+            c.Set(UserHTTPCtxKey, user)
+            return next(c)
+        }
+
+        // 尝试 session
+        sess, user, err := o.validateSession(c)
+        if err != nil {
+            c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, "invalid session"))
+            return next(c)
+        }
+
+        c.Set(UserHTTPCtxKey, user)
+        c.Set(SessionKey, sess)
+        return next(c)
+    }
+}
+```
+
+#### 方案 2：更精确的修复 - 区分 Basic Auth 和 Token 格式
+
+**核心思想**：
+- 只有当 Authorization 头是 **Basic Auth** 格式时才忽略（v3 遗留）
+- **Token 格式**（`token user:token`）应该始终被尊重
+
+**代码实现**：
+
+```go
+func (o *Auth) Middleware(next echo.HandlerFunc) echo.HandlerFunc {
+    return func(c echo.Context) error {
+        hdr := strings.TrimSpace(c.Request().Header.Get("Authorization"))
+
+        hasSessionCookie := strings.Contains(
+            strings.TrimSpace(c.Request().Header.Get("Cookie")),
+            "session=",
+        )
+
+        // 区分 Authorization 头类型
+        isBasicAuth := strings.HasPrefix(hdr, "Basic ")
+        isTokenAuth := strings.HasPrefix(hdr, "token ")
+
+        // ============================================
+        // v3->v4 兼容逻辑：
+        // - 有 session Cookie + Basic Auth（v3 遗留）→ 忽略 Basic Auth
+        // - 有 session Cookie + Token 格式（v4 新格式）→ 不忽略
+        // ============================================
+
+        // 保存原始 hdr 用于可能的回退
+        effectiveHdr := hdr
+
+        if hasSessionCookie && isBasicAuth {
+            // 只有 Basic Auth 格式才忽略（v3 遗留）
+            effectiveHdr = ""
+        }
+
+        // 尝试 API Token 验证
+        if len(effectiveHdr) > 0 {
+            key, token, err := parseAuthHeader(effectiveHdr)
+            if err != nil {
+                c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, err.Error()))
+                return next(c)
+            }
+
+            user, ok := o.GetAPIToken(key, token)
+            if !ok {
+                c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, "invalid API credentials"))
+                return next(c)
+            }
+
+            c.Set(UserHTTPCtxKey, user)
+            return next(c)
+        }
+
+        // 尝试 session 验证
+        sess, user, err := o.validateSession(c)
+        if err != nil {
+            // session 失败
+
+            // ⚠️ 新增：如果是因为忽略了 Basic Auth，回退尝试它
+            // 但这可能导致与 v3->v4 兼容的原始意图冲突...
+            // 需要更仔细的考虑
+
+            // 简单处理：返回错误
+            c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, "invalid session"))
+            return next(c)
+        }
+
+        c.Set(UserHTTPCtxKey, user)
+        c.Set(SessionKey, sess)
+        return next(c)
+    }
+}
+```
+
+**方案 2 的问题**：
+- 只解决了 Token 格式被错误忽略的问题
+- 但没有解决"有效 session + 有效 API Token"的优先级问题
+- 也没有解决"无效 session + 有效 API Token"的回退问题
+
+#### 方案对比
+
+| 维度 | 方案 1（推荐） | 方案 2 |
+|------|---------------|--------|
+| **修复核心问题** | ✅ 会话失败后回退 | ⚠️ 部分修复（只区分格式） |
+| **v3->v4 兼容** | ✅ 有有效 session 时优先使用 | ✅ 忽略 Basic Auth |
+| **Token 格式支持** | ✅ 作为回退 | ✅ 不被忽略 |
+| **代码改动量** | 中等 | 较小 |
+| **行为一致性** | ✅ 逻辑清晰（优先 session，失败回退） | ⚠️ 较复杂（按格式区分） |
+
+**推荐方案**：**方案 1**
+
+理由：
+1. 逻辑更清晰：有 session Cookie 时优先尝试 session
+2. session 无效时回退是合理的预期行为
+3. 完全保持 v3->v4 兼容（有效 session 时不回退）
+4. 修复了所有已知问题场景
+
+---
+
+### 10.8 方案 1 的详细测试场景
+
+#### 测试场景矩阵
+
+| # | 场景 | Session Cookie | API Token | 预期行为 | 方案 1 行为 |
+|---|------|----------------|-----------|---------|------------|
+| 1 | 只有有效 session | ✅ 有效 | ❌ 无 | 使用 session | ✅ 使用 session |
+| 2 | 只有无效 session | ❌ 无效 | ❌ 无 | 403 错误 | ✅ 403 错误 |
+| 3 | 只有有效 API Token | ❌ 无 | ✅ 有效 | 使用 API Token | ✅ 使用 API Token |
+| 4 | 有效 session + 有效 API Token | ✅ 有效 | ✅ 有效 | 使用 session（v3->v4 兼容） | ✅ 使用 session |
+| 5 | **无效 session + 有效 API Token**（核心问题） | ❌ 无效 | ✅ 有效 | 使用 API Token | ✅ 使用 API Token（修复！） |
+| 6 | 有效 session + Basic Auth（v3 遗留） | ✅ 有效 | Basic Auth | 使用 session（v3->v4 兼容） | ✅ 使用 session |
+| 7 | 无效 session + Basic Auth | ❌ 无效 | Basic Auth | 403 或回退？ | ✅ 回退尝试（可配置） |
+
+#### 场景 5 详细验证（核心问题）
+
+```
+改进前（当前代码）：
+┌─────────────────────────────────────────────────────────────────────┐
+│ 请求：                                                              │
+│ Cookie: session=invalid_expired                                      │
+│ Authorization: token myapi:valid_token                                  │
+│                                                                      │
+│ 处理流程：                                                          │
+│ 1. 检测到 session Cookie → 清空 Authorization 头                  │
+│ 2. 尝试验证 session → 失败                                          │
+│ 3. 返回 "invalid session"                                           │
+│                                                                      │
+│ 结果：❌ 403 Forbidden（应该成功！）                              │
+└─────────────────────────────────────────────────────────────────────┘
+
+改进后（方案 1）：
+┌─────────────────────────────────────────────────────────────────────┐
+│ 请求：                                                              │
+│ Cookie: session=invalid_expired                                      │
+│ Authorization: token myapi:valid_token                                  │
+│                                                                      │
+│ 处理流程：                                                          │
+│ 1. 保存 originalHdr = "token myapi:valid_token"                      │
+│ 2. 检测到 hasSessionCookie = true                                   │
+│ 3. 尝试验证 session → 失败（err != nil）                             │
+│ 4. 检查 originalHdr 非空 → 回退尝试 API Token                      │
+│ 5. 解析 API Token → 验证成功                                          │
+│ 6. 使用 API Token，返回 200 OK                                       │
+│                                                                      │
+│ 结果：✅ 200 OK（正确行为）                                       │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+#### 场景 4 验证（v3->v4 兼容保持）
+
+```
+场景：有效 session + 旧 Basic Auth（v3 遗留）
+
+改进前（当前代码）：
+┌─────────────────────────────────────────────────────────────────────┐
+│ 请求：                                                              │
+│ Cookie: session=valid_session                                   │
+│ Authorization: Basic YWRtaW46c2VjcmV0（旧 Basic Auth）              │
+│                                                                      │
+│ 处理流程：                                                          │
+│ 1. 检测到 session Cookie → 清空 Authorization 头                  │
+│ 2. 尝试验证 session → 成功                                          │
+│ 3. 使用 session，返回 200 OK                                         │
+│                                                                      │
+│ 结果：✅ 200 OK（正确行为，避免重定向循环）                           │
+└─────────────────────────────────────────────────────────────────────┘
+
+改进后（方案 1）：
+┌─────────────────────────────────────────────────────────────────────┐
+│ 请求：                                                              │
+│ Cookie: session=valid_session                                      │
+│ Authorization: Basic YWRtaW46c2VjcmV0（旧 Basic Auth）                  │
+│                                                                      │
+│ 处理流程：                                                          │
+│ 1. 保存 originalHdr = "Basic YWRtaW46c2VjcmV0"                       │
+│ 2. 检测到 hasSessionCookie = true                                   │
+│ 3. 尝试验证 session → 成功（err == nil）                            │
+│ 4. 使用 session，返回 200 OK                                           │
+│ 5. ⚠️ 不会回退到 API Token（因为 session 成功了）                   │
+│                                                                      │
+│ 结果：✅ 200 OK（保持 v3->v4 兼容）                              │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 10.9 完整改进代码
+
+#### 推荐的最终实现
+
+```go
+// Middleware is the HTTP middleware used for wrapping HTTP handlers registered on the echo router.
+// It authorizes token (BasicAuth/token) based and cookie based sessions and on successful auth,
+// sets the authenticated User{} on the echo context on the key UserKey. On failure, it sets an Error{}
+// instead on the same key.
+func (o *Auth) Middleware(next echo.HandlerFunc) echo.HandlerFunc {
+    return func(c echo.Context) error {
+        // 保存原始 Authorization 头，用于可能的回退
+        originalHdr := strings.TrimSpace(c.Request().Header.Get("Authorization"))
+
+        // 检查是否有 session Cookie
+        hasSessionCookie := strings.Contains(
+            strings.TrimSpace(c.Request().Header.Get("Cookie")),
+            "session=",
+        )
+
+        // ============================================
+        // 决策逻辑：
+        // - 有 session Cookie：先尝试 session
+        //   - session 有效：使用 session（v3->v4 兼容）
+        //   - session 无效：回退尝试 API Token
+        // - 无 session Cookie：先尝试 API Token，再尝试 session
+        // ============================================
+
+        if hasSessionCookie {
+            // 有 session Cookie：优先尝试 session
+            sess, user, sessErr := o.validateSession(c)
+            if sessErr == nil {
+                // session 有效，使用它
+                // 这保持了 v3->v4 兼容：有有效 session 时忽略 Authorization
+                c.Set(UserHTTPCtxKey, user)
+                c.Set(SessionKey, sess)
+                return next(c)
+            }
+
+            // session 无效，回退尝试 API Token（如果有）
+            if len(originalHdr) > 0 {
+                key, token, err := parseAuthHeader(originalHdr)
+                if err == nil {
+                    apiUser, ok := o.GetAPIToken(key, token)
+                    if ok {
+                        // API Token 有效，使用它
+                        c.Set(UserHTTPCtxKey, apiUser)
+                        return next(c)
+                    }
+                }
+            }
+
+            // 两种方式都失败
+            c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, "invalid session or API credentials"))
+            return next(c)
+        }
+
+        // 无 session Cookie：保持原有行为
+        // 先尝试 API Token，再尝试 session
+
+        if len(originalHdr) > 0 {
+            key, token, err := parseAuthHeader(originalHdr)
+            if err != nil {
+                c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, err.Error()))
+                return next(c)
+            }
+
+            user, ok := o.GetAPIToken(key, token)
+            if !ok {
+                c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, "invalid API credentials"))
+                return next(c)
+            }
+
+            c.Set(UserHTTPCtxKey, user)
+            return next(c)
+        }
+
+        // 尝试 session
+        sess, user, err := o.validateSession(c)
+        if err != nil {
+            c.Set(UserHTTPCtxKey, echo.NewHTTPError(http.StatusForbidden, "invalid session"))
+            return next(c)
+        }
+
+        c.Set(UserHTTPCtxKey, user)
+        c.Set(SessionKey, sess)
+        return next(c)
+    }
+}
+```
+
+#### 关键改进点总结
+
+| 改进点 | 原始代码 | 改进后代码 |
+|--------|---------|-----------|
+| **保存原始 Header** | 不保存 | `originalHdr` 保存原始值 |
+| **Session 失败后** | 直接返回错误 | 回退尝试 API Token |
+| **错误信息** | "invalid session"（误导） | "invalid session or API credentials"（准确） |
+| **v3->v4 兼容** | 有 session Cookie 就忽略 Authorization | 有**有效** session 才忽略 Authorization |
+
+---
+
+### 10.10 风险与缓解措施
+
+#### 潜在风险
+
+| 风险 | 描述 | 缓解措施 |
+|------|------|---------|
+| **行为变化** | 某些边缘场景的行为可能改变 | 全面测试所有场景 |
+| **错误信息变化** | 错误信息从 "invalid session" 变为更通用的消息 | 更新文档，说明新的错误信息 |
+| **性能影响** | session 失败后额外进行一次 API Token 验证 | API Token 验证是内存操作，性能影响可忽略 |
+
+#### 测试建议
+
+1. **单元测试**：
+   - 测试所有 7 种场景
+   - 特别关注场景 5（核心问题）和场景 4（v3->v4 兼容）
+
+2. **集成测试**：
+   - 测试浏览器扩展场景
+   - 测试微前端/iframe 场景
+   - 测试 v3->v4 升级场景
+
+3. **手动测试**：
+   ```bash
+   # 场景 5：无效 session + 有效 API Token（核心问题）
+   curl http://localhost:9000/api/lists \
+     -H "Cookie: session=invalid_session" \
+     -H "Authorization: token testapi:valid_token"
+   # 应该返回 200 OK
+   
+   # 场景 4：有效 session + Basic Auth（v3->v4 兼容）
+   curl http://localhost:9000/api/lists \
+     -H "Cookie: session=valid_session" \
+     -H "Authorization: Basic YWRtaW46c2VjcmV0"
+   # 应该返回 200 OK（使用 session）
+   ```
+
+---
+
+### 10.11 总结
+
+#### 问题根源
+
+1. **根本原因**：当前代码在**验证之前**就清空了 Authorization 头，不考虑 session 是否有效。
+
+2. **设计假设**：
+   - 原始假设：有 session Cookie → 用户已登录 → Authorization 头是旧的 Basic Auth
+   - 实际情况：session Cookie 可能无效，Authorization 头可能是有效的 API Token
+
+3. **错误信息**：
+   - 返回 "invalid session" 而不是 "invalid API credentials"
+   - 误导用户和开发者
+
+#### 改进方案效果
+
+| 场景 | 原始行为 | 改进后行为 |
+|------|---------|-----------|
+| 无效 session + 有效 API Token | ❌ 403 "invalid session" | ✅ 200 OK（使用 API Token） |
+| 有效 session + Basic Auth | ✅ 使用 session | ✅ 使用 session（保持兼容） |
+| 有效 session + API Token | ❌ API Token 被忽略 | ✅ 使用 session（预期行为） |
+| 无 session + API Token | ✅ 使用 API Token | ✅ 使用 API Token |
+
+#### 最终建议
+
+**推荐实施方案 1**（会话失败后回退），因为：
+
+1. ✅ 完全修复核心问题
+2. ✅ 保持 v3->v4 兼容
+3. ✅ 逻辑清晰，易于理解
+4. ✅ 改动量适中，风险可控
+5. ✅ 错误信息更准确
+
+**实施步骤**：
+1. 实现改进后的中间件代码
+2. 添加单元测试覆盖所有场景
+3. 更新错误处理文档
+4. 在测试环境验证
+5. 生产环境部署
