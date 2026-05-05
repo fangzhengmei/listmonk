@@ -293,7 +293,100 @@ func (s *SES) ProcessSubscription(b []byte) error {
 }
 ```
 
-### 4.4 签名验证机制
+### 4.4 关键风险：类型判断前后不一致
+
+**问题定位**：
+
+| 位置 | 代码 | 使用的字符串 |
+|------|------|-------------|
+| `cmd/bounce.go:159` (HTTP 路由层) | `case "SubscriptionConfirmation", "UnsubscribeConfirmation"` | `"UnsubscribeConfirmation"` |
+| `internal/bounce/webhooks/ses.go:91` (业务逻辑层) | `if n.Type == "UnsubscriptionConfirmation"` | `"UnsubscriptionConfirmation"` |
+
+**差异**：
+- 路由层：`"UnsubscribeConfirmation"` (无额外的 'n')
+- 业务层：`"UnsubscriptionConfirmation"` (有额外的 'n' → Un**s**cript**ion**)
+
+**AWS SNS 实际行为**：
+
+根据 AWS SNS 官方文档，消息类型值为：
+- `SubscriptionConfirmation` - 订阅确认
+- `UnsubscribeConfirmation` - 退订确认
+- `Notification` - 实际通知
+
+注意：AWS 使用的是 `"UnsubscribeConfirmation"`（与路由层一致）。
+
+**触发条件**：
+
+当以下情况发生时，bug 会被触发：
+
+1. 用户在 AWS 控制台删除 SNS 订阅
+2. AWS 向 listmonk endpoint 发送 `UnsubscribeConfirmation` 通知
+3. HTTP Header `X-Amz-Sns-Message-Type` = `"UnsubscribeConfirmation"`
+4. JSON Body 中的 `Type` 字段 = `"UnsubscribeConfirmation"`
+
+**执行流程分析**：
+
+```
+请求到达：
+┌─────────────────────────────────────────────────────────────┐
+│ Header: X-Amz-Sns-Message-Type = "UnsubscribeConfirmation"  │
+│ Body: {"Type": "UnsubscribeConfirmation", ...}              │
+└─────────────────────────────────────────────────────────────┘
+                           ↓
+              cmd/bounce.go:159 路由判断
+                           ↓
+              case "SubscriptionConfirmation", "UnsubscribeConfirmation":
+                           ↓
+              ✅ 路由匹配，调用 ProcessSubscription()
+                           ↓
+              internal/bounce/webhooks/ses.go:89-93
+                           ↓
+              u := n.SubscribeURL  // 默认使用 SubscribeURL
+              if n.Type == "UnsubscriptionConfirmation" {  // ❌ 条件判断
+                  u = n.UnsubscribeURL  // 期望：访问 UnsubscribeURL
+              }
+                           ↓
+              ❌ 条件不满足（n.Type = "UnsubscribeConfirmation"）
+                           ↓
+              ❌ 实际访问 n.SubscribeURL 而不是 n.UnsubscribeURL
+```
+
+**影响评估**：
+
+| 维度 | 影响 |
+|------|------|
+| **功能正确性** | 退订确认请求会访问错误的 URL (`SubscribeURL` 而非 `UnsubscribeURL`) |
+| **AWS 状态同步** | AWS 可能认为退订确认未完成，订阅状态可能不一致 |
+| **安全风险** | 较低 - 因为这是退订确认，而非订阅确认 |
+| **可利用性** | 需要 AWS 发送请求，非外部可主动触发 |
+
+**证据对比**：
+
+**文件**：`internal/bounce/webhooks/ses.go:41-44` (数据结构定义)
+
+```go
+type sesNotif struct {
+    // ...
+    Type             string `json:"Type"`
+    SubscribeURL     string `json:"SubscribeURL"`
+    UnsubscribeURL   string `json:"UnsubscribeURL"`  // 注意：字段名是 "UnsubscribeURL"
+}
+```
+
+数据结构中的 `UnsubscribeURL` 也印证了 AWS 使用 `"Unsubscribe"` 而非 `"Unsubscription"`。
+
+**修复建议**：
+
+将 `ses.go:91` 中的：
+```go
+if n.Type == "UnsubscriptionConfirmation" {
+```
+修改为：
+```go
+if n.Type == "UnsubscribeConfirmation" {
+```
+
+### 4.5 签名验证机制
 
 **文件**: `internal/bounce/webhooks/ses.go:198-258`
 
@@ -567,6 +660,37 @@ WHERE $9 = 'delete'
   AND (SELECT num FROM num) >= $8 
   AND id = (SELECT id FROM sub);
 ```
+
+**重要澄清：自动退信处理 vs 手动拉黑 API**
+
+`record-bounce` 是**自动退信处理**的查询，其动作是互斥的。但 listmonk 还提供了一个**独立的手动 API**：
+
+| 查询名称 | 触发方式 | 行为 |
+|----------|----------|------|
+| `record-bounce` | 自动（POP3 扫描、Webhook） | 动作互斥：`blocklist` **或** `unsubscribe` **或** `delete` |
+| `blocklist-bounced-subscribers` | 手动调用 `PUT /api/bounces/blocklist` | **同时**：拉黑订阅者 **并** 从所有列表退订 |
+
+**手动 API 的实现**：`queries/bounces.sql:66-75`
+
+```sql
+-- name: blocklist-bounced-subscribers
+WITH subs AS (
+    SELECT subscriber_id FROM bounces
+),
+b AS (
+    UPDATE subscribers SET status='blocklisted', updated_at=NOW()
+    WHERE id = ANY(SELECT subscriber_id FROM subs)
+)
+UPDATE subscriber_lists SET status='unsubscribed', updated_at=NOW()
+    WHERE subscriber_id = ANY(SELECT subscriber_id FROM subs);
+```
+
+这个手动 API 会：
+1. 找出**所有**有退信记录的订阅者
+2. 将他们设为 `blocklisted`
+3. **同时**将他们从所有列表退订
+
+**这与自动退信处理的 `action = 'blocklist'` 行为不同**，后者只更新 `subscribers.status`，不影响 `subscriber_lists`。
 
 ### 6.5 动作类型详解
 
