@@ -282,9 +282,9 @@ for n := range num {
 }
 ```
 
-### 2.3 设置页测试发送触发路径
+### 2.3 Campaign 测试发送触发路径
 
-测试发送用于在正式发送前预览和验证 campaign 内容。
+Campaign 测试发送用于在正式发送前预览和验证 campaign 内容，**会经过完整的 Manager 队列处理，可触发 Postback webhook**。
 
 #### 2.3.1 触发入口
 
@@ -1659,4 +1659,259 @@ func isRetryableError(err error) bool {
 │                         Webhook 接收服务                          │
 │  ┌─────────────────────────────────────────────────────────┐   │
 │  │  1. Basic Auth 验证                                        │   │
-│  │
+│  │  2. 幂等键检查                                             │   │
+│  │  3. 时间戳验证（防止重放）                                   │   │
+│  │  4. 数据验证                                               │   │
+│  └─────────────────────────────────────────────────────────┘   │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         消息队列（可选）                          │
+│  • 削峰填谷                                                       │
+│  • 异步处理                                                        │
+│  • 重试队列                                                        │
+└─────────────────────────────────────────────────────────────────┘
+                              │
+                              ▼
+┌─────────────────────────────────────────────────────────────────┐
+│                         业务处理层                                │
+│  • 数据映射到 CRM                                                 │
+│  • 幂等键存储                                                      │
+│  • 审计日志                                                        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+#### 7.2.2 错误处理与重试策略
+
+| 错误类型 | listmonk 行为 | 外部系统建议 |
+|----------|---------------|-------------|
+| **网络超时** | 记录日志，无重试 | 实现指数退避重试，设置最大重试次数 |
+| **5xx 响应** | 记录日志，无重试 | 返回 503 或 429，让 listmonk 或代理处理重试 |
+| **4xx 响应** | 记录日志，无重试 | 返回明确的错误信息，避免重试（如 400、401、403） |
+| **非 200 响应** | 视为失败 | 返回 200 表示成功接收，内部异步处理 |
+
+#### 7.2.3 建议的响应状态码
+
+| 场景 | 推荐状态码 | 说明 |
+|------|-----------|------|
+| 处理成功 | `200 OK` | 消息已成功处理 |
+| 已处理过（重复） | `200 OK` 或 `202 Accepted` | 幂等键已存在，返回成功 |
+| 异步接收 | `202 Accepted` | 消息已入队，稍后处理 |
+| 认证失败 | `401 Unauthorized` | Basic Auth 凭据无效 |
+| 权限不足 | `403 Forbidden` | IP 被阻止或无权限 |
+| 请求格式错误 | `400 Bad Request` | JSON 格式错误或缺少必填字段 |
+| 限流 | `429 Too Many Requests` | 请求过于频繁，包含 Retry-After 头 |
+| 服务不可用 | `503 Service Unavailable` | 临时不可用，可重试 |
+
+### 7.3 快速检查清单
+
+在实现 listmonk 与外部 CRM 集成时，请确认以下事项：
+
+#### 7.3.1 触发路径确认
+- [ ] 确认使用的是 Campaign 批量发送、事务消息还是测试发送
+- [ ] 确认 API 端点和调用方式
+- [ ] 确认信使配置（名称、URL、认证信息）
+
+#### 7.3.2 失败处理准备
+- [ ] 确认 `app.max_send_errors` 配置（Campaign 错误阈值）
+- [ ] 准备日志监控和告警
+- [ ] 考虑实现外部重试机制（因为 listmonk 无内置重试）
+
+#### 7.3.3 鉴权与安全
+- [ ] 配置强密码的 Basic Auth 凭据
+- [ ] 考虑 IP 白名单
+- [ ] 强制使用 HTTPS
+- [ ] 准备凭据轮换机制
+
+#### 7.3.4 幂等性保证
+- [ ] 决定使用哪些字段构建幂等键（推荐：`campaign.uuid` + `recipient.uuid`）
+- [ ] 选择幂等键存储方案（Redis 或数据库）
+- [ ] 设置合理的过期时间（建议 24-72 小时）
+
+#### 7.3.5 数据映射
+- [ ] 确认 CRM 联系人对象的字段映射
+- [ ] 确认 CRM 活动对象的字段映射
+- [ ] 确认活动成员关联关系
+- [ ] 准备自定义属性（attribs）的映射规则
+
+## 附录 A：关键代码位置速查表
+
+### A.1 触发路径相关
+
+| 功能 | 文件位置 | 关键函数/方法 |
+|------|----------|--------------|
+| Campaign 状态更新 | `cmd/campaigns.go:352` | `UpdateCampaignStatus()` |
+| Campaign 后台扫描 | `internal/manager/manager.go:423` | `Manager.scanCampaigns()` |
+| 事务消息处理 | `cmd/tx.go:17` | `SendTxMessage()` |
+| 测试发送处理 | `cmd/campaigns.go:520` | `TestCampaign()` |
+
+### A.2 消息处理相关
+
+| 功能 | 文件位置 | 关键函数/方法 |
+|------|----------|--------------|
+| Campaign 消息入队 | `internal/manager/manager.go:213` | `Manager.PushCampaignMessage()` |
+| 事务消息入队 | `internal/manager/manager.go:197` | `Manager.PushMessage()` |
+| Worker 处理循环 | `internal/manager/manager.go:463` | `Manager.worker()` |
+| 错误计数与暂停 | `internal/manager/pipe.go:138` | `pipe.OnError()` |
+
+### A.3 Postback 信使相关
+
+| 功能 | 文件位置 | 关键函数/方法 |
+|------|----------|--------------|
+| Postback 初始化 | `internal/messenger/postback/postback.go:69` | `New()` |
+| 消息推送 | `internal/messenger/postback/postback.go:97` | `Postback.Push()` |
+| HTTP 请求执行 | `internal/messenger/postback/postback.go:156` | `Postback.exec()` |
+
+### A.4 数据模型相关
+
+| 功能 | 文件位置 | 关键结构 |
+|------|----------|----------|
+| 消息结构 | `models/messages.go` | `Message` |
+| 订阅者结构 | `models/subscribers.go` | `Subscriber` |
+| Campaign 结构 | `models/campaigns.go` | `Campaign` |
+
+## 附录 B：配置示例
+
+### B.1 Postback 信使配置示例
+
+```toml
+[messengers]
+  [[messengers.postback]]
+    enabled = true
+    name = "my-postback-messenger"
+    root_url = "https://webhook.example.com/listmonk"
+    username = "listmonk-prod"
+    password = "your-secure-password-123"
+    max_conns = 25
+    retries = 3  # ⚠️ 当前未使用
+    timeout = "5s"
+```
+
+### B.2 应用配置（错误阈值）
+
+```toml
+[app]
+  # 并发 worker 数量
+  concurrency = 4
+  
+  # 每秒发送速率限制
+  message_rate = 100
+  
+  # 连续错误阈值，超过则暂停 campaign
+  # 设置为 0 或负数表示不启用
+  max_send_errors = 10
+```
+
+### B.3 API 调用示例
+
+#### 触发 Campaign 批量发送
+
+```bash
+# 更新 Campaign 状态为 running
+curl -X PUT "http://localhost:9000/api/campaigns/1/status" \
+  -H "Content-Type: application/json" \
+  -u admin:admin123 \
+  -d '{"status": "running"}'
+```
+
+#### 发送事务消息
+
+```bash
+# 发送事务消息（使用 fallback 模式）
+curl -X POST "http://localhost:9000/api/tx" \
+  -H "Content-Type: application/json" \
+  -u admin:admin123 \
+  -d '{
+    "subscriber_mode": "fallback",
+    "subscriber_emails": ["user@example.com"],
+    "template_id": 1,
+    "data": {
+      "verification_code": "123456"
+    },
+    "messenger": "my-postback-messenger"
+  }'
+```
+
+#### 测试发送
+
+```bash
+# 测试发送 Campaign
+curl -X POST "http://localhost:9000/api/campaigns/1/test" \
+  -H "Content-Type: application/json" \
+  -u admin:admin123 \
+  -d '{
+    "subscribers": ["test@example.com"],
+    "messenger": "my-postback-messenger"
+  }'
+```
+
+## 附录 C：常见问题解答
+
+### C.1 为什么 Postback 发送失败后没有重试？
+
+listmonk 当前的 `Postback.exec()` 方法只执行一次 HTTP 调用，没有重试循环。虽然 `Options` 结构中有 `Retries` 字段，但代码中并未使用。这是 listmonk 的已知限制。
+
+**解决方案**：
+1. 在外部系统实现重试逻辑
+2. 使用代理层（如 nginx + lua 或专门的 webhook 代理）
+3. 考虑修改 listmonk 源码添加重试机制
+
+### C.2 如何识别 Campaign 消息和事务消息？
+
+检查 payload 中的 `campaign` 字段：
+- Campaign 消息：`campaign` 不为 null，包含 `uuid`、`name`、`tags` 等信息
+- 事务消息：`campaign` 为 null
+
+```json
+// Campaign 消息
+{
+  "campaign": {
+    "uuid": "123e4567-e89b-12d3-a456-426614174000",
+    "name": "Welcome Campaign",
+    "tags": ["welcome"]
+  }
+}
+
+// 事务消息
+{
+  "campaign": null
+}
+```
+
+### C.3 如何处理同一订阅者收到多封相同邮件的情况？
+
+这通常发生在 Campaign 暂停后重新启动时。listmonk 会从上次中断的位置继续，但可能会有重复。
+
+**防止重复处理的建议**：
+1. 使用幂等键（`campaign.uuid` + `recipient.uuid`）
+2. 在外部系统记录已处理的消息
+3. 设置合理的幂等键过期时间
+
+### C.4 Basic Auth 的密码会被加密传输吗？
+
+Basic Auth 使用 Base64 编码，**不是加密**。Base64 编码的内容可以轻松解码。
+
+**安全建议**：
+1. **强制使用 HTTPS**：只有在 TLS 加密传输时，Basic Auth 才是安全的
+2. 使用强密码
+3. 定期轮换密码
+4. 考虑添加额外的认证层（如 IP 白名单、API Key 等）
+
+### C.5 如何监控 Postback 发送状态？
+
+**listmonk 内置监控**：
+1. 日志：所有发送错误都会记录到日志
+2. Campaign 状态：错误超过阈值会暂停 Campaign 并更新数据库状态
+
+**建议的外部监控**：
+1. 日志收集和告警（如 ELK、Grafana Loki）
+2. 监控外部系统的 webhook 接收端点
+3. 设置健康检查（如 `/health` 端点）
+4. 监控 Campaign 发送统计
+
+---
+
+**报告版本**：v2.0  
+**更新日期**：2024年  
+**分析范围**：listmonk Postback 信使的三类触发路径、失败处理、Payload 映射、幂等性与鉴权
