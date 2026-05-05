@@ -966,7 +966,1149 @@ func (p *pipe) OnError() {
 }
 ```
 
-### 4.9 活动清理与完成
+### 4.9 暂停/取消后的停止机制
+
+#### 4.9.1 停止触发路径
+
+**场景1：用户手动暂停**
+
+```
+触发路径：
+1. 用户点击"暂停"按钮
+2. 前端调用 PUT /api/campaigns/:id/status {status: 'paused'}
+3. 后端 Handler (UpdateCampaignStatus) 验证状态
+4. 更新数据库 status = 'paused'
+5. 调用 a.manager.StopCampaign(id) 发送停止信号
+6. Worker 层级开始处理停止
+```
+
+**代码路径** (`cmd/campaigns.go:351-380`):
+
+```go
+// UpdateCampaignStatus handles campaign status modification.
+func (a *App) UpdateCampaignStatus(c echo.Context) error {
+    // ... 权限检查和参数绑定 ...
+    
+    // 更新数据库中的状态
+    out, err := a.core.UpdateCampaignStatus(id, req.Status)
+    if err != nil {
+        return err
+    }
+    
+    // 关键：如果是暂停或取消，发送信号给 Manager
+    if req.Status == models.CampaignStatusPaused || req.Status == models.CampaignStatusCancelled {
+        a.manager.StopCampaign(id)
+    }
+    
+    return c.JSON(http.StatusOK, okResp{out})
+}
+```
+
+**Manager 层的停止** (`internal/manager/manager.go:405-412`):
+
+```go
+// StopCampaign marks a running campaign as stopped so that all its queued messages are ignored.
+func (m *Manager) StopCampaign(id int) {
+    m.pipesMut.RLock()
+    if p, ok := m.pipes[id]; ok {
+        p.Stop(false)
+    }
+    m.pipesMut.RUnlock()
+}
+```
+
+**Pipe 层的停止** (`internal/manager/pipe.go:153-167`):
+
+```go
+// Stop "marks" a campaign as stopped. It doesn't actually stop the processing
+// of messages. That happens when every queued message in the campaign is processed,
+// marking .wg, the waitgroup counter as done. That triggers cleanup().
+func (p *pipe) Stop(withErrors bool) {
+    // Already stopped.
+    if p.stopped.Load() {
+        return
+    }
+
+    if withErrors {
+        p.withErrors.Store(true)
+    }
+
+    p.stopped.Store(true)
+}
+```
+
+**关键设计**: `Stop()` 只是设置 `stopped` 原子标志，并不直接中断任何协程。这是一种**协作式停止**设计。
+
+#### 4.9.2 多层停止检查机制
+
+停止信号通过三个层级逐层检查：
+
+| 层级 | 检查位置 | 检查时机 | 处理方式 |
+|------|----------|----------|----------|
+| **Layer 1: Worker 发送层** | `internal/manager/manager.go:474-479` | 消息出队后发送前 | 跳过发送，直接 wg.Done() |
+| **Layer 2: NextSubscribers 层** | `internal/manager/pipe.go:83-87` | 拉取订阅者后 | 返回 false，停止继续入队 |
+| **Layer 3: SQL 查询层** | `queries/campaigns.sql:318-372` | 查询订阅者时 | 状态变化导致查询返回空 |
+
+**Layer 1: Worker 发送层检查** (`internal/manager/manager.go:463-558`):
+
+```go
+func (m *Manager) worker() {
+    numMsg := 0
+    for {
+        select {
+        case msg, ok := <-m.campMsgQ:
+            if !ok {
+                return
+            }
+            
+            // 关键检查：活动是否已停止
+            if msg.pipe != nil && msg.pipe.stopped.Load() {
+                // 如果已停止，跳过发送，直接减少等待组计数
+                msg.pipe.wg.Done()
+                continue
+            }
+            
+            // ... 后续发送逻辑 ...
+        }
+    }
+}
+```
+
+**Layer 2: NextSubscribers 层检查** (`internal/manager/pipe.go:72-134`):
+
+```go
+func (p *pipe) NextSubscribers() (bool, error) {
+    // 从数据库拉取下一批订阅者
+    subs, err := p.m.store.NextSubscribers(p.camp.ID, p.m.cfg.BatchSize)
+    if err != nil {
+        return false, fmt.Errorf("error fetching campaign subscribers (%s): %v", p.camp.Name, err)
+    }
+    
+    // 关键检查：没有订阅者可能是因为活动已暂停/取消
+    // 当活动状态从 running 变为 paused/cancelled 时，
+    // next-campaign-subscribers 查询会返回空结果
+    if len(subs) == 0 {
+        return false, nil  // 返回 false 表示没有更多订阅者
+    }
+    
+    // ... 继续处理订阅者 ...
+}
+```
+
+**Layer 3: SQL 查询层** (`queries/campaigns.sql:318-372`):
+
+虽然 `next-campaign-subscribers` 查询本身不直接检查活动状态，但：
+1. 活动状态变化后，`scanCampaigns` 不会再选取该活动
+2. 但已在处理的 pipe 会继续，直到检测到 `stopped` 标志
+
+#### 4.9.3 已入队消息的处理
+
+**问题**: 当调用 `StopCampaign()` 时，可能有大量消息已经入队 (`campMsgQ` 队列中)，这些消息怎么办？
+
+**答案**: 这些消息会被 Worker 消费，但在发送前会检查 `stopped` 标志，然后直接跳过发送。
+
+**处理流程**:
+
+```
+时间线：
+T0: 活动正常运行
+    - NextSubscribers() 拉取 1000 个订阅者
+    - 1000 条消息推入 campMsgQ 队列
+    - Worker 开始处理这些消息
+
+T1: 用户点击暂停
+    - 数据库 status = 'paused'
+    - 调用 StopCampaign(id)
+    - pipe.stopped.Store(true)
+
+T2: Worker 继续消费队列中的消息
+    - 消息 501: 检查 stopped=true → 跳过发送，wg.Done()
+    - 消息 502: 检查 stopped=true → 跳过发送，wg.Done()
+    - ...
+    - 消息 1000: 检查 stopped=true → 跳过发送，wg.Done()
+
+T3: 所有消息处理完毕
+    - wg 计数器归零
+    - 触发 p.cleanup()
+    - 从 pipes Map 中移除
+    - 记录日志 "stop processing campaign (xxx)"
+```
+
+**关键代码** (`internal/manager/pipe.go:186-239`):
+
+```go
+func (p *pipe) cleanup() {
+    // ... 从 pipes Map 移除 ...
+    
+    // 情况1：因错误暂停
+    if p.withErrors.Load() {
+        // 更新数据库状态为 paused
+        if err := p.m.store.UpdateCampaignStatus(p.camp.ID, models.CampaignStatusPaused); err != nil {
+            // ...
+        }
+        _ = p.m.sendNotif(p.camp, models.CampaignStatusPaused, "Too many errors")
+        return
+    }
+    
+    // 情况2：手动停止（暂停/取消）
+    if p.stopped.Load() {
+        p.m.log.Printf("stop processing campaign (%s)", p.camp.Name)
+        return  // 注意：这里不更新数据库状态！
+    }
+    
+    // 情况3：自然完成
+    // ...
+}
+```
+
+**注意**: 手动暂停的情况下，`cleanup()` 不会更新数据库状态，因为数据库状态已经在 `UpdateCampaignStatus` Handler 中更新过了。
+
+### 4.10 恢复机制
+
+#### 4.10.1 可恢复状态
+
+**可编辑/可恢复的状态** (`cmd/campaigns.go:830-834`):
+
+```go
+func canEditCampaign(status string) bool {
+    return status == models.CampaignStatusDraft ||
+        status == models.CampaignStatusPaused ||
+        status == models.CampaignStatusScheduled
+}
+```
+
+**恢复场景**:
+
+| 当前状态 | 可恢复到 | 条件 |
+|----------|----------|------|
+| `paused` | `running` | 立即恢复发送 |
+| `paused` | `scheduled` | 必须设置新的 send_at |
+| `scheduled` | `running` | 有 send_at 时会被 SQL 拦截为 scheduled |
+| `scheduled` | `draft` | 只有 scheduled 可以转回 draft |
+
+#### 4.10.2 从 paused 恢复到 running
+
+**触发路径**:
+
+```
+1. 用户点击"恢复"按钮
+2. 前端调用 PUT /api/campaigns/:id/status {status: 'running'}
+3. 验证：paused 可以转为 running（通过状态流转检查）
+4. 更新数据库 status = 'running'
+5. 等待 scanCampaigns 下次扫描（最多 5 秒）
+6. scanCampaigns 检测到 status='running' 且不在当前处理列表中
+7. 创建新的 pipe
+8. 从 last_subscriber_id 继续拉取订阅者
+```
+
+**关键代码**:
+
+**状态流转验证** (`internal/core/campaigns.go:270-273`):
+
+```go
+case models.CampaignStatusRunning:
+    // 只有 paused 或 draft 可以转为 running
+    if cm.Status != models.CampaignStatusPaused && cm.Status != models.CampaignStatusDraft {
+        errMsg = c.i18n.T("campaigns.onlyPausedDraft")
+    }
+```
+
+**scanCampaigns 重新处理** (`internal/manager/manager.go:423-459`):
+
+```go
+func (m *Manager) scanCampaigns(tick time.Duration) {
+    // ...
+    for range t.C {
+        // 获取当前正在处理的活动 ID
+        ids, counts := m.getCurrentCampaigns()
+        
+        // 查询条件：
+        // WHERE (status='running' OR (status='scheduled' AND NOW()>=send_at))
+        // AND NOT(campaigns.id = ANY($1::INT[]))  // 排除当前正在处理的
+        campaigns, err := m.store.NextCampaigns(ids, counts)
+        // ...
+        
+        for _, c := range campaigns {
+            // 创建新的 pipe
+            p, err := m.newPipe(c)
+            // ...
+            
+            // 加入处理队列
+            select {
+            case m.nextPipes <- p:
+            default:
+                // 队列满则稍后重试
+                p.Stop(false)
+                p.wg.Done()
+            }
+        }
+    }
+}
+```
+
+#### 4.10.3 断点续传机制（游标设计）
+
+**核心设计**: 使用 `last_subscriber_id` 作为游标，而非 OFFSET 分页。
+
+**数据表中的字段**:
+
+```sql
+campaigns 表:
+- last_subscriber_id: 上次处理的最后一个订阅者 ID
+- max_subscriber_id: 本次活动的订阅者 ID 上限（首次扫描时计算）
+```
+
+**SQL 查询** (`queries/campaigns.sql:318-372`):
+
+```sql
+-- name: next-campaign-subscribers
+WITH campLists AS (
+    -- ...
+),
+subs AS (
+    SELECT s.*
+    FROM (
+        SELECT DISTINCT s.id
+        FROM subscriber_lists sl
+        JOIN campLists ON sl.list_id = campLists.list_id
+        JOIN subscribers s ON s.id = sl.subscriber_id
+        WHERE
+            sl.list_id = ANY($5::INT[])
+            -- 关键：游标位置
+            AND s.id > $3   -- last_subscriber_id
+            -- 关键：上限 ID（优化查询）
+            AND s.id <= $4  -- max_subscriber_id
+            -- 排除黑名单
+            AND s.status != 'blocklisted'
+            -- ... 订阅状态检查 ...
+        ORDER BY s.id LIMIT $6  -- batch_size
+    ) subIDs JOIN subscribers s ON (s.id = subIDs.id) ORDER BY s.id
+),
+u AS (
+    -- 更新游标位置
+    UPDATE campaigns
+    SET last_subscriber_id = (SELECT MAX(id) FROM subs), updated_at = NOW()
+    WHERE (SELECT COUNT(id) FROM subs) > 0 AND id=$1
+)
+SELECT * FROM subs;
+```
+
+**恢复时的数据流**:
+
+```
+场景：活动发送了 2500 个订阅者后被暂停，然后恢复
+
+暂停前：
+- last_subscriber_id = 2500
+- max_subscriber_id = 10000
+- sent = 2500
+
+恢复时：
+1. scanCampaigns 创建新的 pipe
+2. NextSubscribers() 调用 SQL 查询
+3. SQL: WHERE s.id > 2500 AND s.id <= 10000
+4. 返回订阅者 2501-3500（假设 batch_size=1000）
+5. 继续发送，sent 从 2500 开始递增
+6. 直到 s.id > 10000，查询返回空
+7. 活动完成，sent = 10000
+```
+
+**关键代码更新游标** (`internal/manager/pipe.go:219-239` cleanup):
+
+```go
+func (p *pipe) cleanup() {
+    // ...
+    
+    // 更新发送计数和最后 ID 到数据库
+    // 这确保即使活动被暂停，进度也会被保存
+    if err := p.m.store.UpdateCampaignCounts(
+        p.camp.ID, 
+        0, 
+        int(p.sent.Load()), 
+        int(p.lastID.Load())
+    ); err != nil {
+        p.m.log.Printf("error updating campaign counts (%s): %v", p.camp.Name, err)
+    }
+    
+    // ...
+}
+```
+
+**注意**: `lastID` 是在 Worker 成功发送后更新的原子变量 (`internal/manager/manager.go:537-540`):
+
+```go
+} else {
+    // 只有发送成功才更新 lastID
+    id := uint64(msg.Subscriber.ID)
+    if id > msg.pipe.lastID.Load() {
+        msg.pipe.lastID.Store(uint64(msg.Subscriber.ID))
+    }
+    msg.pipe.rate.Incr(1)
+    msg.pipe.sent.Add(1)
+}
+```
+
+#### 4.10.4 恢复场景总结
+
+| 场景 | 数据库状态 | 恢复方式 | 进度保存 |
+|------|-----------|----------|----------|
+| 暂停后恢复 | `status='paused'` | 设为 `running` | `last_subscriber_id` 保持 |
+| 暂停后重新调度 | `status='paused'` | 设为 `scheduled`（需设置 `send_at`） | `last_subscriber_id` 保持 |
+| 调度后改草稿 | `status='scheduled'` | 设为 `draft` | `last_subscriber_id` 重置为 0 |
+| 取消后 | `status='cancelled'` | 不可恢复 | 进度保留但无法继续 |
+
+**注意**: `cancelled` 状态是**终态**，无法恢复。如果需要恢复，只能创建新的活动。
+
+---
+
+## 五、高级边界分析
+
+### 5.1 恢复后发送进度如何衔接（断点续传深度解析）
+
+#### 5.1.1 两个关键进度字段
+
+在断点续传机制中，有两个字段协同工作来保存和恢复发送进度：
+
+| 字段名 | 数据类型 | 更新时机 | 作用 |
+|--------|----------|----------|------|
+| `sent` | INT | 每批清理时累加 | 统计已发送总数（用于显示进度） |
+| `last_subscriber_id` | INT | 两种方式更新 | 游标位置（用于继续拉取） |
+
+**SQL 更新逻辑** (`queries/campaigns.sql:435-441`):
+
+```sql
+-- name: update-campaign-counts
+UPDATE campaigns SET
+    -- to_send: 只有传入非0值才更新
+    to_send=(CASE WHEN $2 != 0 THEN $2 ELSE to_send END),
+    -- sent: 累加更新！关键！
+    sent=sent+$3,
+    -- last_subscriber_id: 只有传入>0时才更新
+    last_subscriber_id=(CASE WHEN $4 > 0 THEN $4 ELSE last_subscriber_id END),
+    updated_at=NOW()
+WHERE id=$1;
+```
+
+**关键发现**: `sent` 字段是**累加更新**的（`sent = sent + $3`），这意味着即使活动被暂停多次，每次恢复时 sent 计数都会从之前的基础上继续累加。
+
+#### 5.1.2 两种更新游标的方式
+
+**方式1：每批拉取后自动更新** (`queries/campaigns.sql:318-372`)
+
+在 `next-campaign-subscribers` 查询中，每次成功拉取一批订阅者后，会自动更新 `last_subscriber_id`：
+
+```sql
+WITH campLists AS (
+    -- ... 关联列表 ...
+),
+subs AS (
+    SELECT s.*
+    FROM (
+        SELECT DISTINCT s.id
+        FROM subscriber_lists sl
+        JOIN campLists ON sl.list_id = campLists.list_id
+        JOIN subscribers s ON s.id = sl.subscriber_id
+        WHERE
+            sl.list_id = ANY($5::INT[])
+            -- 游标条件：大于上次的 last_subscriber_id
+            AND s.id > $3   -- last_subscriber_id
+            -- 上限条件：不超过 max_subscriber_id
+            AND s.id <= $4  -- max_subscriber_id
+            AND s.status != 'blocklisted'
+            -- ... 订阅状态检查 ...
+        ORDER BY s.id LIMIT $6  -- batch_size
+    ) subIDs JOIN subscribers s ON (s.id = subIDs.id) ORDER BY s.id
+),
+u AS (
+    -- 关键：每批拉取后自动更新游标
+    UPDATE campaigns
+    SET last_subscriber_id = (SELECT MAX(id) FROM subs), updated_at = NOW()
+    WHERE (SELECT COUNT(id) FROM subs) > 0 AND id=$1
+)
+SELECT * FROM subs;
+```
+
+**方式2：活动停止/完成时更新** (`internal/manager/pipe.go:186-239`)
+
+在 `cleanup()` 函数中，会调用 `UpdateCampaignCounts` 来保存最终进度：
+
+```go
+func (p *pipe) cleanup() {
+    // ... 从 pipes Map 移除 ...
+
+    // 关键：更新发送计数和最后 ID 到数据库
+    // 这确保即使活动被暂停，进度也会被保存
+    if err := p.m.store.UpdateCampaignCounts(
+        p.camp.ID, 
+        0,                  // to_send: 0 表示不更新
+        int(p.sent.Load()), // sent: 本次 pipe 发送的数量（累加）
+        int(p.lastID.Load()) // last_subscriber_id: 最后处理的 ID
+    ); err != nil {
+        p.m.log.Printf("error updating campaign counts (%s): %v", p.camp.Name, err)
+    }
+
+    // ... 后续处理 ...
+}
+```
+
+#### 5.1.3 内存中的进度跟踪
+
+每个 `pipe` 都有两个原子变量来跟踪内存中的进度：
+
+```go
+type pipe struct {
+    // ... 其他字段 ...
+    sent       atomic.Int64    // 本次 pipe 发送成功的计数
+    lastID     atomic.Uint64   // 最后一个发送成功的订阅者 ID
+    // ...
+}
+```
+
+**lastID 的更新时机** (`internal/manager/manager.go:537-543`):
+
+```go
+} else {
+    // 关键：只有发送成功才更新 lastID
+    id := uint64(msg.Subscriber.ID)
+    if id > msg.pipe.lastID.Load() {
+        msg.pipe.lastID.Store(uint64(msg.Subscriber.ID))
+    }
+    msg.pipe.rate.Incr(1)
+    msg.pipe.sent.Add(1)  // sent 也只在成功时增加
+}
+```
+
+**重要**: `lastID` 和 `sent` 都只在**发送成功**时更新。这意味着：
+- 如果发送失败，`lastID` 不会更新，`sent` 也不会增加
+- 恢复时会从上次成功发送的 ID 开始继续
+
+#### 5.1.4 恢复时的完整数据流
+
+让我们通过一个详细的时间线来理解断点续传的完整流程：
+
+```
+场景：活动有 10000 个订阅者，发送 2500 个后被暂停，然后恢复
+
+================================================================================
+阶段1：首次运行
+================================================================================
+
+T0: scanCampaigns 首次扫描
+    - 检测到 status='running' 且不在当前处理列表
+    - 创建新的 pipe
+    - 查询 next-campaigns SQL 计算：
+        * to_send = 10000
+        * max_subscriber_id = 10000
+    - 更新数据库：to_send=10000, max_subscriber_id=10000
+    - 此时数据库状态：
+        sent = 0
+        last_subscriber_id = 0
+        max_subscriber_id = 10000
+
+T1: NextSubscribers() 第1次调用
+    - SQL: s.id > 0 AND s.id <= 10000
+    - 返回订阅者 1-1000（假设 batch_size=1000）
+    - SQL 自动更新 last_subscriber_id = 1000
+    - 此时数据库状态：
+        last_subscriber_id = 1000
+
+T2: Worker 处理消息 1-1000
+    - 每个消息发送成功后：
+        pipe.sent++
+        pipe.lastID 更新为该订阅者 ID（如果更大）
+    - 全部发送成功后：
+        pipe.sent = 1000
+        pipe.lastID = 1000
+
+T3: NextSubscribers() 第2次调用
+    - SQL: s.id > 1000 AND s.id <= 10000
+    - 返回订阅者 1001-2000
+    - SQL 自动更新 last_subscriber_id = 2000
+
+T4: Worker 处理消息 1001-2000
+    - 全部发送成功后：
+        pipe.sent = 2000
+        pipe.lastID = 2000
+
+T5: NextSubscribers() 第3次调用
+    - SQL: s.id > 2000 AND s.id <= 10000
+    - 返回订阅者 2001-3000
+    - SQL 自动更新 last_subscriber_id = 3000
+
+T6: Worker 开始处理消息 2001-3000
+    - 处理到 2500 个时，用户点击暂停
+
+================================================================================
+阶段2：用户暂停操作
+================================================================================
+
+T7: 前端调用 PUT /api/campaigns/:id/status {status: 'paused'}
+    - 后端更新数据库 status = 'paused'
+    - 调用 a.manager.StopCampaign(id)
+    - pipe.stopped.Store(true)
+
+T8: Worker 继续处理队列中的消息
+    - 消息 2501: 检查 stopped=true → 跳过发送，wg.Done()
+    - 消息 2502: 检查 stopped=true → 跳过发送，wg.Done()
+    - ...
+    - 消息 3000: 检查 stopped=true → 跳过发送，wg.Done()
+
+T9: wg 计数器归零，触发 cleanup()
+    - 调用 UpdateCampaignCounts(
+        campID, 
+        0,                  // to_send 不更新
+        2500,               // sent = 2500（累加）
+        2500                // last_subscriber_id = 2500
+      )
+    - 数据库更新：
+        sent = 0 + 2500 = 2500
+        last_subscriber_id = 2500 （覆盖之前 SQL 设置的 3000）
+    - 关键：cleanup 中的 lastID 以实际发送成功的 2500 为准！
+    - 从 pipes Map 中移除 pipe
+
+T10: 暂停后的数据库状态
+    status = 'paused'
+    sent = 2500
+    last_subscriber_id = 2500
+    max_subscriber_id = 10000
+
+================================================================================
+阶段3：用户恢复操作
+================================================================================
+
+T11: 用户点击"恢复"
+    - 前端调用 PUT /api/campaigns/:id/status {status: 'running'}
+    - 后端验证：paused 可以转为 running
+    - 更新数据库 status = 'running'
+    - 注意：不调用 StopCampaign，因为没有停止
+
+T12: 等待 scanCampaigns 下次扫描（最多 5 秒）
+
+T13: scanCampaigns 扫描
+    - 检测到 status='running' 且不在当前处理列表
+    - 创建新的 pipe（新的实例！）
+    - 新 pipe 的初始状态：
+        pipe.sent = 0
+        pipe.lastID = 0
+    - 调用 next-campaigns SQL
+    - 此时数据库的：
+        last_subscriber_id = 2500
+        max_subscriber_id = 10000
+
+T14: NextSubscribers() 第1次调用（新 pipe）
+    - SQL: s.id > 2500 AND s.id <= 10000  ← 关键：从 2501 开始！
+    - 返回订阅者 2501-3500
+    - SQL 自动更新 last_subscriber_id = 3500
+
+T15: Worker 处理消息 2501-3500
+    - 每个消息发送成功后：
+        pipe.sent++ （新的计数，从 0 开始）
+        pipe.lastID 更新
+    - 全部发送成功后：
+        pipe.sent = 1000
+        pipe.lastID = 3500
+
+T16: 继续这个循环...
+
+================================================================================
+阶段4：活动完成
+================================================================================
+
+T17: 所有订阅者处理完毕（10000 个）
+    - NextSubscribers() 返回空
+    - 触发 cleanup()
+    - 调用 UpdateCampaignCounts(
+        campID, 
+        0, 
+        7500,  // 本次 pipe 发送 7500 个
+        10000
+      )
+    - 数据库更新：
+        sent = 2500 + 7500 = 10000  ← 累加！
+        last_subscriber_id = 10000
+    - 更新 status = 'finished'
+
+================================================================================
+最终状态
+================================================================================
+status = 'finished'
+sent = 10000  ← 正确的总数
+last_subscriber_id = 10000
+max_subscriber_id = 10000
+```
+
+#### 5.1.5 关键设计要点总结
+
+| 设计决策 | 实现方式 | 优势 |
+|----------|----------|------|
+| **游标而非分页** | `s.id > last_subscriber_id` | 支持千万级表，避免 OFFSET 性能问题 |
+| **双层游标更新** | SQL 每批更新 + cleanup 最终更新 | 即使中途崩溃，SQL 更新的游标也能作为起点 |
+| **实际发送优先** | cleanup 的 lastID 覆盖 SQL 的 last_subscriber_id | 确保从实际发送成功的位置恢复 |
+| **累加计数** | `sent = sent + $3` | 多次暂停/恢复后，sent 统计正确 |
+| **内存独立** | 每次恢复创建新的 pipe | 无历史状态干扰，干净恢复 |
+
+### 5.2 可恢复与不可恢复状态的边界
+
+#### 5.2.1 前端状态判断（计算属性）
+
+**文件位置**: `frontend/src/views/Campaign.vue:700-720`
+
+```javascript
+computed: {
+    // 哪些状态可以编辑活动属性？
+    canEdit() {
+        return this.isNew
+            || this.data.status === 'draft' 
+            || this.data.status === 'scheduled' 
+            || this.data.status === 'paused';
+    },
+
+    // 哪些状态可以立即发送？
+    canStart() {
+        return (this.data.status === 'draft' || this.data.status === 'paused') 
+            && !this.form.sendLater;
+    },
+
+    // 哪些状态可以调度？
+    canSchedule() {
+        return (this.data.status === 'draft' || this.data.status === 'paused') 
+            && (this.form.sendLater && this.form.sendAtDate);
+    },
+
+    // 哪些状态可以取消调度？
+    canUnSchedule() {
+        return this.data.status === 'scheduled';
+    },
+
+    // 哪些状态可以归档？
+    canArchive() {
+        return this.data.status !== 'cancelled' && this.data.type !== 'optin';
+    },
+}
+```
+
+#### 5.2.2 后端状态流转验证
+
+**文件位置**: `internal/core/campaigns.go:250-303`
+
+```go
+func (c *Core) UpdateCampaignStatus(id int, status string) (models.Campaign, error) {
+    cm, err := c.GetCampaign(id, "", "")
+    if err != nil {
+        return models.Campaign{}, err
+    }
+    
+    errMsg := ""
+    switch status {
+    case models.CampaignStatusDraft:
+        // 只能从 scheduled 转回 draft
+        if cm.Status != models.CampaignStatusScheduled {
+            errMsg = c.i18n.T("campaigns.onlyScheduledAsDraft")
+        }
+    case models.CampaignStatusScheduled:
+        // 只能从 draft 或 paused 转为 scheduled
+        if cm.Status != models.CampaignStatusDraft && cm.Status != models.CampaignStatusPaused {
+            errMsg = c.i18n.T("campaigns.onlyDraftAsScheduled")
+        }
+        // 必须有 send_at
+        if !cm.SendAt.Valid {
+            errMsg = c.i18n.T("campaigns.needsSendAt")
+        }
+    case models.CampaignStatusRunning:
+        // 只能从 draft 或 paused 转为 running
+        if cm.Status != models.CampaignStatusPaused && cm.Status != models.CampaignStatusDraft {
+            errMsg = c.i18n.T("campaigns.onlyPausedDraft")
+        }
+    case models.CampaignStatusPaused:
+        // 只能从 running 转为 paused
+        if cm.Status != models.CampaignStatusRunning {
+            errMsg = c.i18n.T("campaigns.onlyActivePause")
+        }
+    case models.CampaignStatusCancelled:
+        // 只能从 running 或 paused 转为 cancelled
+        if cm.Status != models.CampaignStatusRunning && cm.Status != models.CampaignStatusPaused {
+            errMsg = c.i18n.T("campaigns.onlyActiveCancel")
+        }
+    }
+    
+    if len(errMsg) > 0 {
+        return models.Campaign{}, echo.NewHTTPError(http.StatusBadRequest, errMsg)
+    }
+    
+    // 执行状态更新
+    res, err := c.q.UpdateCampaignStatus.Exec(cm.ID, status)
+    // ...
+}
+```
+
+#### 5.2.3 完整状态流转图（带边界）
+
+```
+                    ┌──────────────────────────────────────────────────────────────┐
+                    │                    状态流转边界图                              │
+                    └──────────────────────────────────────────────────────────────┘
+                    
+                    ┌──────────────────────────────────────────────────────────────┐
+                    │  可编辑状态（canEdit=true）                                   │
+                    │  ┌─────────┐     ┌───────────┐     ┌───────────┐            │
+                    │  │  draft  │────►│ scheduled │     │  paused   │            │
+                    │  │ (草稿)  │     │ (已调度)  │◄────│ (已暂停)  │            │
+                    │  └────┬────┘     └─────┬─────┘     └─────┬─────┘            │
+                    │       │                │                 │                   │
+                    │       │                │                 │                   │
+                    └───────┼────────────────┼─────────────────┼───────────────────┘
+                            │                │                 │
+                            │                │                 │
+                            ▼                ▼                 ▼
+                    ┌──────────────────────────────────────────────────────────────┐
+                    │  运行中状态（canEdit=false）                                 │
+                    │  ┌─────────────────────────────────────────────────────────┐ │
+                    │  │                      running                             │ │
+                    │  │                     (运行中)                            │ │
+                    │  └─────────────────────────────────────────────────────────┘ │
+                    │                              │                               │
+                    │                              │                               │
+                    └──────────────────────────────┼───────────────────────────────┘
+                                                   │
+                                                   │
+                           ┌───────────────────────┼───────────────────────┐
+                           │                       │                       │
+                           ▼                       ▼                       ▼
+                    ┌───────────┐         ┌───────────┐         ┌───────────┐
+                    │  paused   │         │ cancelled │         │ finished  │
+                    │ (可恢复)  │         │ (不可恢复)│         │ (不可恢复)│
+                    └───────────┘         └───────────┘         └───────────┘
+                           │                       │                       │
+                           │                       │                       │
+                           │                   终态（无法转出）              │
+                           └───────────────────────────────────────────────┘
+
+状态流转规则：
+──────────────────────────────────────────────────────────────────────────────
+可编辑状态（canEdit=true）：
+  - draft, scheduled, paused
+  - 可以修改活动属性、列表、模板等
+
+运行中状态（canEdit=false）：
+  - running
+  - 禁止修改任何属性
+  - 只能转为 paused 或 cancelled
+
+终态（不可恢复）：
+  - finished: 活动正常完成
+  - cancelled: 活动被取消
+  - 无法转出到任何其他状态
+
+恢复路径：
+  - paused → running (立即恢复)
+  - paused → scheduled (重新调度)
+  - scheduled → draft (转为草稿)
+  - scheduled → running (时间到达后自动)
+```
+
+#### 5.2.4 为什么 cancelled 是终态？
+
+**代码层面的原因**：
+
+1. **后端状态流转验证不允许转出** (`internal/core/campaigns.go`):
+
+```go
+// 没有任何 case 允许从 cancelled 转出
+// UpdateCampaignStatus 只验证"目标状态"的前置条件
+// 但如果当前状态是 cancelled，任何目标状态的验证都会失败
+
+// 例如：要转为 running，当前状态必须是 draft 或 paused
+case models.CampaignStatusRunning:
+    if cm.Status != models.CampaignStatusPaused && cm.Status != models.CampaignStatusDraft {
+        errMsg = c.i18n.T("campaigns.onlyPausedDraft")
+    }
+// 如果 cm.Status 是 cancelled，这里就会报错
+```
+
+2. **前端计算属性不允许编辑** (`frontend/src/views/Campaign.vue`):
+
+```javascript
+canEdit() {
+    return this.isNew
+        || this.data.status === 'draft' 
+        || this.data.status === 'scheduled' 
+        || this.data.status === 'paused';
+    // 没有 'cancelled'！
+}
+```
+
+3. **scanCampaigns 不会选取 cancelled** (`queries/campaigns.sql:186`):
+
+```sql
+WHERE (status='running' OR (status='scheduled' AND NOW() >= campaigns.send_at))
+```
+
+**业务层面的原因**：
+
+- `cancelled` 表示用户明确放弃这个活动
+- `paused` 表示暂时停止，可能还会继续
+- `finished` 表示正常完成
+- 如果 `cancelled` 可以恢复，语义上就和 `paused` 没有区别了
+
+### 5.3 错误阈值触发暂停与人工暂停的差异
+
+#### 5.3.1 两种暂停的触发方式对比
+
+| 对比项 | 错误阈值触发暂停 | 人工暂停 |
+|--------|------------------|----------|
+| **触发者** | 系统自动 (`OnError()`) | 用户手动操作 |
+| **触发条件** | 连续错误达到 `max_send_errors` | 用户点击"暂停"按钮 |
+| **代码入口** | `internal/manager/pipe.go:136-151` | `cmd/campaigns.go:351-380` |
+| **数据库更新时机** | `cleanup()` 中更新 | Handler 中立即更新 |
+| **通知发送** | 自动发送"Too many errors"通知 | 不发送通知 |
+
+#### 5.3.2 代码实现差异
+
+**错误阈值触发暂停** (`internal/manager/pipe.go:136-151`):
+
+```go
+// OnError keeps track of the number of errors that occur while sending messages
+// and pauses the campaign if the error threshold is met.
+func (p *pipe) OnError() {
+    if p.m.cfg.MaxSendErrors < 1 {
+        return
+    }
+    
+    // 增加错误计数
+    count := p.errors.Add(1)
+    if int(count) < p.m.cfg.MaxSendErrors {
+        return
+    }
+    
+    // 关键：Stop(true) - withErrors = true
+    p.Stop(true)
+    p.m.log.Printf("error count exceeded %d. pausing campaign %s", p.m.cfg.MaxSendErrors, p.camp.Name)
+}
+```
+
+**人工暂停** (`cmd/campaigns.go:351-380`):
+
+```go
+func (a *App) UpdateCampaignStatus(c echo.Context) error {
+    // ... 权限检查和参数绑定 ...
+    
+    // 更新数据库中的状态
+    out, err := a.core.UpdateCampaignStatus(id, req.Status)
+    if err != nil {
+        return err
+    }
+    
+    // 如果是暂停或取消，发送信号给 Manager
+    if req.Status == models.CampaignStatusPaused || req.Status == models.CampaignStatusCancelled {
+        // 关键：StopCampaign 最终调用 p.Stop(false) - withErrors = false
+        a.manager.StopCampaign(id)
+    }
+    
+    return c.JSON(http.StatusOK, okResp{out})
+}
+```
+
+**Manager 层的 StopCampaign** (`internal/manager/manager.go:405-412`):
+
+```go
+func (m *Manager) StopCampaign(id int) {
+    m.pipesMut.RLock()
+    if p, ok := m.pipes[id]; ok {
+        // 关键：Stop(false) - withErrors = false
+        p.Stop(false)
+    }
+    m.pipesMut.RUnlock()
+}
+```
+
+**Pipe 层的 Stop** (`internal/manager/pipe.go:153-167`):
+
+```go
+func (p *pipe) Stop(withErrors bool) {
+    // Already stopped.
+    if p.stopped.Load() {
+        return
+    }
+
+    // 关键差异：withErrors 标志
+    if withErrors {
+        p.withErrors.Store(true)
+    }
+
+    p.stopped.Store(true)
+}
+```
+
+#### 5.3.3 cleanup() 中的处理差异
+
+**文件位置**: `internal/manager/pipe.go:186-239`
+
+```go
+func (p *pipe) cleanup() {
+    // ... 从 pipes Map 移除 ...
+    
+    // 更新发送计数到数据库
+    if err := p.m.store.UpdateCampaignCounts(
+        p.camp.ID, 
+        0, 
+        int(p.sent.Load()), 
+        int(p.lastID.Load())
+    ); err != nil {
+        p.m.log.Printf("error updating campaign counts (%s): %v", p.camp.Name, err)
+    }
+
+    // ============================================================
+    // 分支1：因错误暂停（withErrors = true）
+    // ============================================================
+    if p.withErrors.Load() {
+        // 关键：需要在这里更新数据库状态！
+        // 因为 OnError() 只是设置了标志，没有更新数据库
+        if err := p.m.store.UpdateCampaignStatus(
+            p.camp.ID, 
+            models.CampaignStatusPaused
+        ); err != nil {
+            p.m.log.Printf(
+                "error updating campaign (%s) status to %s: %v", 
+                p.camp.Name, 
+                models.CampaignStatusPaused, 
+                err
+            )
+        } else {
+            p.m.log.Printf("set campaign (%s) to %s", p.camp.Name, models.CampaignStatusPaused)
+        }
+        
+        // 关键：发送通知给管理员
+        _ = p.m.sendNotif(
+            p.camp, 
+            models.CampaignStatusPaused, 
+            "Too many errors"
+        )
+        return
+    }
+
+    // ============================================================
+    // 分支2：手动停止（paused 或 cancelled）
+    // ============================================================
+    if p.stopped.Load() {
+        // 关键：不需要更新数据库状态！
+        // 因为 UpdateCampaignStatus Handler 已经更新过了
+        p.m.log.Printf("stop processing campaign (%s)", p.camp.Name)
+        return
+    }
+
+    // ============================================================
+    // 分支3：自然完成
+    // ============================================================
+    // ... 完成处理 ...
+}
+```
+
+#### 5.3.4 完整流程图对比
+
+**场景A：错误阈值触发暂停**
+
+```
+时间线：
+──────────────────────────────────────────────────────────────────────────────
+
+T0: 活动正常运行
+    - status = 'running'
+    - 正在发送邮件
+
+T1: SMTP 服务器故障，连续发送失败
+    - Worker 检测到错误
+    - 调用 msg.pipe.OnError()
+    - pipe.errors 计数增加
+
+T2: 连续错误达到 max_send_errors（假设 100）
+    - OnError() 中：count >= MaxSendErrors
+    - 调用 p.Stop(true)  ← withErrors = true
+    - 设置 pipe.stopped = true
+    - 设置 pipe.withErrors = true
+    - 日志："error count exceeded 100. pausing campaign XXX"
+
+T3: Worker 继续处理队列中的消息
+    - 每个消息检查 pipe.stopped = true
+    - 跳过发送，直接 wg.Done()
+
+T4: wg 归零，触发 cleanup()
+    - 分支1：p.withErrors.Load() = true
+    - 调用 UpdateCampaignStatus(status='paused')  ← 数据库状态更新
+    - 日志："set campaign (XXX) to paused"
+    - 调用 sendNotif(camp, 'paused', 'Too many errors')  ← 发送通知
+    - 从 pipes Map 移除
+
+T5: 最终状态
+    - status = 'paused'
+    - 用户看到"暂停"状态
+    - 用户收到"Too many errors"通知
+    - 用户可以选择恢复或取消
+```
+
+**场景B：人工暂停**
+
+```
+时间线：
+──────────────────────────────────────────────────────────────────────────────
+
+T0: 活动正常运行
+    - status = 'running'
+    - 正在发送邮件
+
+T1: 用户点击"暂停"按钮
+    - 前端调用 PUT /api/campaigns/:id/status {status: 'paused'}
+
+T2: 后端 Handler 处理 (UpdateCampaignStatus)
+    - 验证：当前状态是 running，可以转为 paused
+    - 调用 core.UpdateCampaignStatus()
+    - 执行 SQL：UPDATE campaigns SET status='paused' WHERE id=?  ← 立即更新！
+    - 调用 a.manager.StopCampaign(id)
+    - 返回成功响应
+
+T3: Manager 层处理 (StopCampaign)
+    - 从 pipes Map 找到 pipe
+    - 调用 p.Stop(false)  ← withErrors = false
+    - 设置 pipe.stopped = true
+    - 不设置 pipe.withErrors
+
+T4: Worker 继续处理队列中的消息
+    - 每个消息检查 pipe.stopped = true
+    - 跳过发送，直接 wg.Done()
+
+T5: wg 归零，触发 cleanup()
+    - 分支1：p.withErrors.Load() = false  ← 不进入
+    - 分支2：p.stopped.Load() = true  ← 进入
+    - 日志："stop processing campaign (XXX)"
+    - 关键：不更新数据库状态！（Handler 已经更新过了）
+    - 关键：不发送通知！
+    - 从 pipes Map 移除
+
+T6: 最终状态
+    - status = 'paused'
+    - 用户看到"暂停"状态
+    - 用户没有收到通知
+    - 用户可以选择恢复或取消
+```
+
+#### 5.3.5 差异总结表
+
+| 对比维度 | 错误阈值触发暂停 | 人工暂停 |
+|----------|------------------|----------|
+| **触发条件** | 连续错误达到 `max_send_errors` | 用户手动点击 |
+| **Stop() 参数** | `Stop(true)` - withErrors=true | `Stop(false)` - withErrors=false |
+| **数据库更新时机** | `cleanup()` 中更新 | Handler 中立即更新 |
+| **数据库更新位置** | `pipe.go:cleanup()` | `campaigns.go:UpdateCampaignStatus` |
+| **通知发送** | 发送"Too many errors"通知 | 不发送通知 |
+| **恢复方式** | 与人工暂停相同 | 与错误暂停相同 |
+| **用户感知** | 收到错误通知，知道是系统问题 | 自己操作，不需要通知 |
+
+**关键差异点**：
+
+1. **错误暂停**：系统检测到问题，需要通知管理员
+2. **人工暂停**：用户主动操作，不需要通知
+3. **两种暂停的恢复方式完全相同** - 都是从 `paused` 转为 `running` 或 `scheduled`
+
+### 4.11 活动清理与完成
 
 **文件位置**: `internal/manager/pipe.go:186-239`
 
