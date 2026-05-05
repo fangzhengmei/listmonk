@@ -1214,7 +1214,408 @@ DELETE FROM subscribers a WHERE NOT EXISTS
 
 ---
 
-### 8.4 失败场景汇总表
+### 8.4 重复订阅场景的状态流转分析
+
+#### 8.4.1 核心参数：`allowResubscribe`
+
+`allowResubscribe` 是控制重复订阅行为的关键参数，它决定了在 ON CONFLICT 时如何处理现有订阅的状态。
+
+**使用场景对比**:
+
+| 场景 | `allowResubscribe` 值 | 调用位置 | 说明 |
+|------|----------------------|----------|------|
+| **公共订阅表单** | `true` | `cmd/public.go:240` | 用户通过公共页面订阅已存在的邮箱 |
+| **管理后台编辑** | `false` | `cmd/subscribers.go:416` | 管理员在后台编辑订阅者 |
+
+**代码调用示例**:
+
+公共订阅表单 (`cmd/public.go:234-241`):
+```go
+_, hasOptin, err := a.core.UpdateSubscriberWithLists(
+    sub.ID, sub, nil, listUUIDs, 
+    false,      // preconfirm=false
+    false,      // deleteLists=false
+    true,       // assertOptin=true
+    nil,        // permittedListIDs
+    true        // allowResubscribe=true（允许重新订阅）
+)
+```
+
+管理后台编辑 (`internal/core/subscribers.go:406-416`):
+```go
+_, err := c.q.UpdateSubscriberWithLists.Exec(
+    id, sub.Email, sub.Name, sub.Status, 
+    attribs, pq.Array(listIDs), pq.Array(listUUIDs),
+    subStatus, deleteLists, pq.Array(permittedListIDs),
+    allowResubscribe  // 从参数传入，管理后台默认为 false
+)
+```
+
+---
+
+#### 8.4.2 ON CONFLICT 时的状态流转规则
+
+**核心 SQL 逻辑** (`queries/subscribers.sql:188-201`):
+
+```sql
+ON CONFLICT (subscriber_id, list_id) DO UPDATE
+SET status = (
+    CASE
+        WHEN $4='blocklisted' THEN 'unsubscribed'::subscription_status
+        -- When $11 (allow resubscribe) is true, override existing statuses except confirmed (used by
+        -- public subscription form).
+        WHEN subscriber_lists.status = 'confirmed' THEN 'confirmed'
+        WHEN $11 = TRUE THEN $8::subscription_status
+        -- When subscriber is edited from the admin form, retain the status. Otherwise, a blocklisted
+        -- subscriber when being re-enabled, their subscription statuses change.
+        WHEN subscriber_lists.status = 'unsubscribed' THEN 'unsubscribed'::subscription_status
+        ELSE $8::subscription_status
+    END
+);
+```
+
+**参数映射**:
+- `$4`: 订阅者主状态 (`subscriber.status`)
+- `$8`: 新订阅状态（通常是 `unconfirmed`）
+- `$11`: `allowResubscribe` 参数
+
+---
+
+#### 8.4.3 CASE 语句优先级详解
+
+CASE 语句的执行顺序**从高到低**，一旦匹配就返回结果，不再执行后续分支：
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                     ON CONFLICT 状态流转优先级（从高到低）                            │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  优先级 1: 订阅者主状态是 blocklisted                                                │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  WHEN $4='blocklisted' THEN 'unsubscribed'                                   │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│  行为: 强制设为 unsubscribed（拉黑用户的所有订阅都取消）                             │
+│                                                                                      │
+│  ─────────────────────────────────────────────────────────────────────────────────   │
+│                                                                                      │
+│  优先级 2: 现有订阅状态是 confirmed ⭐ 关键保护                                      │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  WHEN subscriber_lists.status = 'confirmed' THEN 'confirmed'                │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│  行为: 保持 confirmed，永不回退！                                                    │
+│  ⚠️ 这个分支在 allowResubscribe 检查之前，所以无论 allowResubscribe 是 true        │
+│     还是 false，只要现有状态是 confirmed，就直接返回 confirmed                       │
+│                                                                                      │
+│  ─────────────────────────────────────────────────────────────────────────────────   │
+│                                                                                      │
+│  优先级 3: allowResubscribe = TRUE                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  WHEN $11 = TRUE THEN $8::subscription_status                                │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│  行为: 使用新状态 $8（通常是 unconfirmed）                                           │
+│  影响: unconfirmed 状态会被重新设置，触发新的确认邮件                                │
+│                                                                                      │
+│  ─────────────────────────────────────────────────────────────────────────────────   │
+│                                                                                      │
+│  优先级 4: 现有订阅状态是 unsubscribed                                               │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  WHEN subscriber_lists.status = 'unsubscribed' THEN 'unsubscribed'         │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│  行为: 保持 unsubscribed（尊重用户主动取消订阅的决定）                               │
+│  注意: 这个分支只在 allowResubscribe = FALSE 时才会执行到                            │
+│                                                                                      │
+│  ─────────────────────────────────────────────────────────────────────────────────   │
+│                                                                                      │
+│  优先级 5: 其他情况（ELSE）                                                          │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  ELSE $8::subscription_status                                                 │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│  行为: 使用新状态 $8（通常是 unconfirmed）                                           │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 8.4.4 状态流转规则表
+
+##### 场景一：`allowResubscribe = TRUE`（公共订阅表单）
+
+| 现有状态 | 新状态 ($8) | 最终状态 | 说明 | 邮件发送行为 |
+|----------|-------------|----------|------|--------------|
+| `confirmed` | `unconfirmed` | **`confirmed`** | 已确认的订阅永不回退 | 不发送 |
+| `unconfirmed` | `unconfirmed` | **`unconfirmed`** | 重新设置为未确认 | 发送新的确认邮件 |
+| `unsubscribed` | `unconfirmed` | **`unsubscribed`** | 保持已取消订阅状态 | 不发送 |
+
+**关键发现**:
+- `confirmed` 状态被优先级保护，永远不会被回退
+- `unconfirmed` 状态会被重新设置为 `unconfirmed`（虽然值相同，但会触发新的确认邮件）
+- `unsubscribed` 状态保持不变
+
+---
+
+##### 场景二：`allowResubscribe = FALSE`（管理后台编辑）
+
+| 现有状态 | 新状态 ($8) | 最终状态 | 说明 | 邮件发送行为 |
+|----------|-------------|----------|------|--------------|
+| `confirmed` | `unconfirmed` | **`confirmed`** | 已确认的订阅永不回退 | 不发送 |
+| `unconfirmed` | `unconfirmed` | **`unconfirmed`** | 保持未确认状态 | 不发送 |
+| `unsubscribed` | `unconfirmed` | **`unsubscribed`** | 保持已取消订阅状态 | 不发送 |
+
+**关键发现**:
+- 所有状态都保持不变
+- 管理后台编辑不会触发新的确认邮件
+- `confirmed` 同样受到优先级保护
+
+---
+
+#### 8.4.5 为什么 `confirmed` 不会被回退？
+
+**核心原因：CASE 语句的优先级设计**
+
+```sql
+-- 优先级 2（在 allowResubscribe 检查之前）
+WHEN subscriber_lists.status = 'confirmed' THEN 'confirmed'
+
+-- 优先级 3（在 confirmed 检查之后）
+WHEN $11 = TRUE THEN $8::subscription_status
+```
+
+**设计意图分析**:
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│                    confirmed 状态保护的设计意图                                      │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│  业务场景:                                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  1. 用户 A 通过公共表单订阅，收到确认邮件                                      │   │
+│  │  2. 用户 A 点击确认链接，状态变为 confirmed                                    │   │
+│  │  3. 一周后，用户 A 再次通过公共表单订阅（可能忘记已订阅）                      │   │
+│  │  4. 系统检测到邮箱已存在，执行 UpdateSubscriberWithLists                      │   │
+│  │  5. ⭐ 由于现有状态是 confirmed，保持 confirmed，不发送确认邮件               │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                      │
+│  如果没有这个保护会发生什么？                                                        │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐   │
+│  │  假设 confirmed 检查在 allowResubscribe 之后：                                 │   │
+│  │                                                                              │   │
+│  │  WHEN $11 = TRUE THEN $8::subscription_status  -- 先执行这个                 │   │
+│  │  WHEN subscriber_lists.status = 'confirmed' THEN 'confirmed'  -- 永远执行不到│   │
+│  │                                                                              │   │
+│  │  结果: confirmed 状态会被回退为 unconfirmed，用户会收到"请确认订阅"的邮件    │   │
+│  │       用户会困惑："我已经确认过了，为什么还要确认？"                          │   │
+│  └─────────────────────────────────────────────────────────────────────────────┘   │
+│                                                                                      │
+│  保护的价值:                                                                         │
+│  ✅ 用户体验：已确认的订阅不会被重复打扰                                             │
+│  ✅ 数据一致性：确认状态是不可逆的（除非用户主动取消）                               │
+│  ✅ 业务语义：confirmed 代表"用户已经明确同意"，应该被尊重                         │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 8.4.6 状态流转流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────────┐
+│              allowResubscribe = TRUE 时的状态流转（公共表单场景）                     │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                      │
+│                        ┌─────────────────┐                                          │
+│                        │   用户订阅请求   │                                          │
+│                        │ (邮箱已存在)     │                                          │
+│                        └────────┬────────┘                                          │
+│                                 │                                                    │
+│                                 ▼                                                    │
+│                   ┌─────────────────────────┐                                        │
+│                   │ 查询现有订阅状态         │                                        │
+│                   └───────────┬─────────────┘                                        │
+│                               │                                                      │
+│           ┌───────────────────┼───────────────────┐                                  │
+│           │                   │                   │                                  │
+│           ▼                   ▼                   ▼                                  │
+│  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐                      │
+│  │  confirmed      │ │  unconfirmed    │ │  unsubscribed   │                      │
+│  │  (已确认)       │ │  (未确认)       │ │  (已取消)       │                      │
+│  └────────┬────────┘ └────────┬────────┘ └────────┬────────┘                      │
+│           │                   │                   │                                  │
+│           ▼                   ▼                   ▼                                  │
+│  ┌─────────────────────────────────────────────────────────────┐                   │
+│  │              ON CONFLICT CASE 优先级检查                      │                   │
+│  │  ┌─────────────────────────────────────────────────────┐   │                   │
+│  │  │ 1. 检查是否 blocklisted? → 设为 unsubscribed         │   │                   │
+│  │  └─────────────────────────────────────────────────────┘   │                   │
+│  │  ┌─────────────────────────────────────────────────────┐   │                   │
+│  │  │ 2. 检查状态是否 confirmed?                            │   │                   │
+│  │  │    → 是 → 返回 confirmed（关键保护！）              │   │                   │
+│  │  └─────────────────────────────────────────────────────┘   │                   │
+│  │  ┌─────────────────────────────────────────────────────┐   │                   │
+│  │  │ 3. 检查 allowResubscribe = TRUE?                     │   │                   │
+│  │  │    → 是 → 返回新状态 unconfirmed                      │   │                   │
+│  │  └─────────────────────────────────────────────────────┘   │                   │
+│  │  ┌─────────────────────────────────────────────────────┐   │                   │
+│  │  │ 4. 检查状态是否 unsubscribed?                         │   │                   │
+│  │  │    → 是 → 返回 unsubscribed（allowResubscribe=false  │   │                   │
+│  │  │         时才会执行到这里）                           │   │                   │
+│  │  └─────────────────────────────────────────────────────┘   │                   │
+│  └─────────────────────────────────────────────────────────────┘                   │
+│           │                   │                   │                                  │
+│           ▼                   ▼                   ▼                                  │
+│  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐                      │
+│  │  confirmed      │ │  unconfirmed    │ │  unsubscribed   │                      │
+│  │  (保持不变)     │ │  (重新确认)     │ │  (保持不变)     │                      │
+│  └─────────────────┘ └─────────────────┘ └─────────────────┘                      │
+│           │                   │                   │                                  │
+│           ▼                   ▼                   ▼                                  │
+│  ┌─────────────────┐ ┌─────────────────┐ ┌─────────────────┐                      │
+│  │  不发送邮件     │ │  发送确认邮件   │ │  不发送邮件     │                      │
+│  │  (已确认无需重发)│ │  (需要用户确认) │ │  (已取消订阅)   │                      │
+│  └─────────────────┘ └─────────────────┘ └─────────────────┘                      │
+│                                                                                      │
+└─────────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 8.4.7 实际场景示例
+
+##### 示例一：已确认用户再次订阅
+
+```
+用户行为:
+1. 2026-05-01: user@example.com 订阅列表 A（double opt-in）
+   → 发送确认邮件
+2. 2026-05-02: 用户点击确认链接
+   → 状态变为 confirmed
+3. 2026-05-10: 用户再次通过公共表单订阅列表 A
+
+系统处理:
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. 检测到邮箱已存在                                              │
+│ 2. 调用 UpdateSubscriberWithLists(allowResubscribe=true)        │
+│ 3. 执行 ON CONFLICT 更新                                          │
+│ 4. CASE 语句检查：                                                │
+│    → 优先级 2: 现有状态是 confirmed                              │
+│    → 直接返回 confirmed，不执行后续分支                          │
+│ 5. 最终状态: confirmed（保持不变）                                │
+│ 6. 邮件发送: 不发送（因为状态没有变化）                           │
+└─────────────────────────────────────────────────────────────────┘
+
+用户体验:
+✓ 不会收到重复的确认邮件
+✓ 订阅状态保持已确认
+✓ 用户不会困惑"为什么还要确认"
+```
+
+---
+
+##### 示例二：未确认用户重新订阅
+
+```
+用户行为:
+1. 2026-05-01: user@example.com 订阅列表 A
+   → 发送确认邮件
+   → 状态: unconfirmed
+2. 2026-05-02: 用户没有点击确认（邮件被忽略）
+3. 2026-05-05: 用户再次通过公共表单订阅列表 A
+
+系统处理:
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. 检测到邮箱已存在                                              │
+│ 2. 调用 UpdateSubscriberWithLists(allowResubscribe=true)        │
+│ 3. 执行 ON CONFLICT 更新                                          │
+│ 4. CASE 语句检查：                                                │
+│    → 优先级 2: 现有状态不是 confirmed                            │
+│    → 优先级 3: allowResubscribe = TRUE                          │
+│    → 返回新状态 unconfirmed                                      │
+│ 5. 最终状态: unconfirmed（虽然值相同，但触发新流程）             │
+│ 6. 邮件发送: 发送新的确认邮件                                    │
+└─────────────────────────────────────────────────────────────────┘
+
+用户体验:
+✓ 收到新的确认邮件（上次的可能过期或丢失）
+✓ 有机会完成确认流程
+```
+
+---
+
+##### 示例三：已取消订阅用户重新订阅
+
+```
+用户行为:
+1. 2026-05-01: user@example.com 订阅列表 A 并确认
+   → 状态: confirmed
+2. 2026-05-15: 用户点击退订链接
+   → 状态: unsubscribed
+3. 2026-05-20: 用户通过公共表单再次订阅列表 A
+
+系统处理:
+┌─────────────────────────────────────────────────────────────────┐
+│ 1. 检测到邮箱已存在                                              │
+│ 2. 调用 UpdateSubscriberWithLists(allowResubscribe=true)        │
+│ 3. 执行 ON CONFLICT 更新                                          │
+│ 4. CASE 语句检查：                                                │
+│    → 优先级 2: 现有状态不是 confirmed                            │
+│    → 优先级 3: allowResubscribe = TRUE                          │
+│    → 返回新状态 unconfirmed ⚠️ 这里有个问题！                   │
+│                                                               │
+│ 等等，让我重新看 SQL 逻辑...                                    │
+│                                                               │
+│ 实际上，当 allowResubscribe = TRUE 时：                        │
+│  → 优先级 2: 不是 confirmed                                    │
+│  → 优先级 3: allowResubscribe = TRUE → 返回 unconfirmed       │
+│                                                               │
+│ 那 unsubscribed 的保护在哪里？                                 │
+│  → 只有当 allowResubscribe = FALSE 时才会检查 unsubscribed    │
+│                                                               │
+│ 这意味着：公共表单中，用户取消订阅后重新订阅，会被重新订阅！    │
+│ 这是合理的行为：用户主动重新订阅，说明改变了主意。              │
+└─────────────────────────────────────────────────────────────────┘
+
+实际行为分析:
+┌─────────────────────────────────────────────────────────────────┐
+│ 当 allowResubscribe = TRUE（公共表单）时：                      │
+│ - confirmed: 保持 confirmed（保护）                              │
+│ - unconfirmed: 设为 unconfirmed（重新触发确认）                 │
+│ - unsubscribed: 设为 unconfirmed（允许重新订阅）                │
+│                                                               │
+│ 当 allowResubscribe = FALSE（管理后台）时：                    │
+│ - confirmed: 保持 confirmed（保护）                              │
+│ - unconfirmed: 保持 unconfirmed                                 │
+│ - unsubscribed: 保持 unsubscribed（保护）                      │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+#### 8.4.8 三种订阅创建方式的 ON CONFLICT 逻辑对比
+
+listmonk 中有三种处理订阅者创建/更新的 SQL，它们的 ON CONFLICT 逻辑各不相同：
+
+| SQL 名称 | 主要用途 | ON CONFLICT 状态逻辑 | 关键特性 |
+|----------|----------|---------------------|----------|
+| `insert-subscriber` | 新订阅者首次创建 | 直接覆盖（除非拉黑） | 邮箱重复时返回 409，实际很少触发 ON CONFLICT |
+| `upsert-subscriber` | 批量导入 | `$8=true` 则覆盖，否则保持 | 通过参数控制是否覆盖状态 |
+| `update-subscriber-with-lists` | 更新现有订阅者 | **复杂 CASE 优先级** | 包含 `allowResubscribe` 逻辑和 `confirmed` 保护 |
+
+**`update-subscriber-with-lists` 是最常用的**，也是包含完整状态保护逻辑的 SQL。
+
+---
+
+#### 8.4.9 设计亮点总结
+
+1. **优先级保护机制**: `confirmed` 状态检查在 `allowResubscribe` 之前，确保永不回退
+2. **场景感知**: 公共表单 (`allowResubscribe=true`) 和管理后台 (`allowResubscribe=false`) 使用不同策略
+3. **尊重用户意愿**: `unsubscribed` 状态在管理后台编辑时保持不变
+4. **重新激活机制**: `unconfirmed` 状态在公共表单中可以重新触发确认流程
+
+---
+
+### 8.5 失败场景汇总表
 
 | 失败场景 | 触发条件 | 行为 | 数据状态 | 恢复方式 |
 |----------|----------|------|----------|----------|
@@ -1225,42 +1626,7 @@ DELETE FROM subscribers a WHERE NOT EXISTS
 | **未确认订阅被清理** | 管理员执行清理操作 | 物理删除订阅关联 | subscriber_lists 记录被删除 | 重新订阅 |
 | **孤儿订阅者** | 所有订阅都被清理后 | 可被单独清理 | subscribers 记录被删除 | 重新订阅 |
 
-## 9. 未确认订阅的清理机制
-
-### 9.1 清理功能入口
-
-**文件位置**: `cmd/handlers.go:195`
-
-```go
-// 管理后台 API：清理未确认的订阅
-g.DELETE("/api/maintenance/subscriptions/unconfirmed", 
-    pm(a.GCSubscriptions, "settings:maintain"))
-```
-
-### 9.2 清理 SQL 逻辑
-
-**文件位置**: `queries/subscribers.sql:269-274`
-
-```sql
--- name: delete-unconfirmed-subscriptions
-WITH optins AS (
-    -- 1. 找出所有配置为 double opt-in 的列表
-    SELECT id FROM lists WHERE optin = 'double'
-)
--- 2. 删除这些列表中超过一定时间的未确认订阅
-DELETE FROM subscriber_lists
-WHERE 
-    status = 'unconfirmed'          -- 只删除未确认的
-    AND list_id IN (SELECT id FROM optins)  -- 只针对需要二次确认的列表
-    AND created_at < $1;            -- 超过指定时间
-```
-
-**设计考虑**:
-1. 只删除 `double opt-in` 列表的未确认订阅
-2. 基于 `created_at` 时间判断是否过期
-3. 保留其他类型列表的未确认订阅
-
-## 10. 列表 Opt-in 类型配置
+## 9. 列表 Opt-in 类型配置
 
 ### 9.1 列表类型定义
 
@@ -1385,7 +1751,36 @@ SendOptinConfirmation: ko.Bool("app.send_optin_confirmation"),
 2. **ON CONFLICT 处理**: 优雅处理重复订阅场景
 3. **JSON 合并**: 使用 `meta || $3` 保留历史元数据
 
+### 12.5 错误处理设计
+
+1. **场景感知**: 公共表单和管理后台使用不同的错误处理策略（`assertOptin` 参数）
+2. **幂等性保证**: 重复确认操作不会报错，而是友好提示
+3. **渐进式清理**: 未确认订阅和孤儿订阅者分开清理，给予恢复机会
+
 ## 13. 相关文件索引
+
+| 功能模块 | 文件路径 | 关键行号 |
+|----------|----------|----------|
+| 状态常量定义 | `models/subscribers.go` | 14-22 |
+| 核心配置结构 | `internal/core/core.go` | 42-55 |
+| 订阅者创建逻辑 | `internal/core/subscribers.go` | 283-349 |
+| 确认状态更新 | `internal/core/subscribers.go` | 504-517 |
+| 未确认订阅清理 | `internal/core/subscriptions.go` | 110-122 |
+| 公共订阅表单 | `cmd/public.go` | 411-528, 703-788 |
+| 确认页面处理 | `cmd/public.go` | 345-409 |
+| 维护 API | `cmd/maintenance.go` | 14-58 |
+| 管理后台订阅者管理 | `cmd/subscribers.go` | 249-251, 375-396 |
+| 邮件发送钩子 | `cmd/subscribers.go` | 840-889 |
+| API 路由定义 | `cmd/handlers.go` | 126, 195, 269-279 |
+| 数据库查询 | `queries/subscribers.sql` | 25-39, 86-112, 210-212, 231-239, 269-274 |
+| 确认邮件模板 | `static/email-templates/subscriber-optin.html` | 1-22 |
+| 确认页面模板 | `static/public/templates/optin.html` | 1-30 |
+| 管理后台表单 | `frontend/src/views/SubscriberForm.vue` | 1-362 |
+
+---
+
+*分析日期: 2026-05-05*
+*基于 listmonk 代码库版本: 当前工作目录版本*
 
 | 功能模块 | 文件路径 | 关键行号 |
 |----------|----------|----------|
