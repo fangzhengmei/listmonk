@@ -2,7 +2,7 @@
 
 ## 概述
 
-本报告详细分析 listmonk 中订阅者自定义字段（Attributes）的存储结构、数据传输流程，以及与订阅表单的交互机制。
+本报告详细分析 listmonk 中订阅者自定义字段（Attributes）的存储结构、数据传输流程，以及与订阅表单的交互机制。特别关注了 Forms.vue 页面的表单生成链路，并对比说明为什么它不属于真正的"自定义字段 schema 驱动动态渲染"。
 
 ---
 
@@ -52,7 +52,7 @@ type Subscriber struct {
     UUID    string         `db:"uuid" json:"uuid"`
     Email   string         `db:"email" json:"email" form:"email"`
     Name    string         `db:"name" json:"name" form:"name"`
-    Attribs JSON           `db:"attribs" json:"attribs"`  // 自定义属性
+    Attribs JSON           `db:"attribs" json:"attribs"`  -- 自定义属性
     Status  string         `db:"status" json:"status"`
     Lists   types.JSONText `db:"lists" json:"lists"`
 }
@@ -61,15 +61,15 @@ type Subscriber struct {
 **文件**: `models/common.go:112-134`
 
 ```go
-// JSON 是 map[string]any 的类型别名，用于处理数据库的 JSONB 字段
+-- JSON 是 map[string]any 的类型别名，用于处理数据库的 JSONB 字段
 type JSON map[string]any
 
-// Value 实现 driver.Valuer 接口，将 JSON 序列化存入数据库
+-- Value 实现 driver.Valuer 接口，将 JSON 序列化存入数据库
 func (s JSON) Value() (driver.Value, error) {
     return json.Marshal(s)
 }
 
-// Scan 实现 sql.Scanner 接口，从数据库反序列化 JSON
+-- Scan 实现 sql.Scanner 接口，从数据库反序列化 JSON
 func (s JSON) Scan(b any) error {
     if b == nil {
         s = make(JSON)
@@ -109,122 +109,489 @@ func (s JSON) Scan(b any) error {
 
 ---
 
-## 二、数据传输流程
+## 二、Forms.vue 表单生成链路分析
 
-### 2.1 API 接口定义
+### 2.1 功能概述
 
-#### 创建订阅者
-**文件**: `docs/docs/content/apis/subscribers.md:300-340`
+**Forms.vue** (`frontend/src/views/Forms.vue`) 是管理后台的一个页面，用于生成**可嵌入的 HTML 订阅表单代码**。它的主要功能是：
 
-```json
-// POST /api/subscribers
-{
-  "email": "subscriber@domain.com",
-  "name": "The Subscriber",
-  "status": "enabled",
-  "lists": [1],
-  "attribs": {
-    "city": "Bengaluru",
-    "projects": 3,
-    "stack": { "languages": ["go", "python"] }
-  }
-}
-```
+1. 显示所有 `type === 'public'` 的邮件列表
+2. 让用户勾选需要包含在表单中的列表
+3. 根据选择动态生成 HTML 表单代码
+4. 用户可以复制这些代码嵌入到外部网站
 
-#### 公共订阅 API
-**文件**: `docs/docs/content/apis/subscribers.md:364-398`
+### 2.2 数据流详解
 
-```json
-// POST /api/public/subscription
-{
-  "email": "subscriber@domain.com",
-  "name": "The Subscriber",
-  "list_uuids": ["eb420c55-4cfb-4972-92ba-c93c34ba475d"]
-  // ⚠️ 注意：此接口不支持直接传入 attribs
-}
-```
+#### 步骤 1：配置从数据库加载到内存
 
-### 2.2 后端处理逻辑
-
-#### 创建订阅者处理
-**文件**: `internal/core/subscribers.go:286-349`
+**文件**: `cmd/init.go:431-454`
 
 ```go
-func (c *Core) InsertSubscriber(sub models.Subscriber, listIDs []int, listUUIDs []string, preconfirm, assertOptin bool) (models.Subscriber, bool, error) {
-    // ... 省略前置代码 ...
-    
-    // 直接将 sub.Attribs 存入数据库
-    if err = c.q.InsertSubscriber.Get(&sub.ID,
-        sub.UUID,
-        sub.Email,
-        strings.TrimSpace(sub.Name),
-        sub.Status,
-        sub.Attribs,  // 直接传入，无 schema 验证
-        pq.Array(listIDs),
-        pq.Array(listUUIDs),
-        subStatus); err != nil {
-        // ... 错误处理 ...
+func initSettings(query string, db *sqlx.DB, ko *koanf.Koanf) {
+    var s types.JSONText
+    -- 从数据库 settings 表读取所有配置
+    if err := db.Get(&s, query); err != nil {
+        lo.Fatalf("error reading settings from DB: %s", msg)
+    }
+
+    -- 将点分隔的键解嵌套为 map
+    var out map[string]any
+    if err := json.Unmarshal(s, &out); err != nil {
+        lo.Fatalf("error unmarshalling settings from DB: %v", err)
     }
     
-    // ... 省略后续代码 ...
+    -- 加载到 koanf 配置系统
+    if err := ko.Load(confmap.Provider(out, "."), nil); err != nil {
+        lo.Fatalf("error parsing settings from DB: %v", err)
+    }
 }
 ```
 
-#### 更新订阅者处理
-**文件**: `internal/core/subscribers.go:352-383`
+#### 步骤 2：配置通过 API 下发到前端
+
+**文件**: `cmd/admin.go:41-91`
 
 ```go
-func (c *Core) UpdateSubscriber(id int, sub models.Subscriber) (models.Subscriber, error) {
-    // 格式化 JSON 属性
-    attribs := []byte("{}")
-    if len(sub.Attribs) > 0 {
-        if b, err := json.Marshal(sub.Attribs); err != nil {
-            return models.Subscriber{}, echo.NewHTTPError(...)
-        } else {
-            attribs = b
-        }
+type serverConfig struct {
+    RootURL            string `json:"root_url"`
+    FromEmail          string `json:"from_email"`
+    PublicSubscription struct {
+        Enabled          bool        `json:"enabled"`
+        CaptchaEnabled   bool        `json:"captcha_enabled"`
+        CaptchaProvider  null.String `json:"captcha_provider"`
+        CaptchaKey       null.String `json:"captcha_key"`
+        AltchaComplexity int         `json:"altcha_complexity"`
+    } `json:"public_subscription"`
+    -- ... 其他配置字段
+}
+
+-- GET /api/config 端点
+func (a *App) GetServerConfig(c echo.Context) error {
+    out := serverConfig{
+        RootURL:       a.urlCfg.RootURL,
+        FromEmail:     a.cfg.FromEmail,
+        -- ...
+    }
+    out.PublicSubscription.Enabled = a.cfg.EnablePublicSubPage
+
+    -- 验证码配置
+    if a.cfg.Security.Captcha.Altcha.Enabled {
+        out.PublicSubscription.CaptchaEnabled = true
+        out.PublicSubscription.CaptchaProvider = null.StringFrom(captcha.ProviderAltcha)
+        out.PublicSubscription.AltchaComplexity = a.cfg.Security.Captcha.Altcha.Complexity
+    } else if a.cfg.Security.Captcha.HCaptcha.Enabled {
+        out.PublicSubscription.CaptchaEnabled = true
+        out.PublicSubscription.CaptchaProvider = null.StringFrom(captcha.ProviderHCaptcha)
+        out.PublicSubscription.CaptchaKey = null.StringFrom(a.cfg.Security.Captcha.HCaptcha.Key)
     }
 
-    _, err := c.q.UpdateSubscriber.Exec(id,
-        sub.Email,
-        strings.TrimSpace(sub.Name),
-        sub.Status,
-        json.RawMessage(attribs),  // 序列化为 JSON 存储
-    )
-    // ...
+    -- ... 其他配置处理
+
+    return c.JSON(http.StatusOK, okResp{out})
 }
 ```
 
-### 2.3 前端 API 层
+#### 步骤 3：前端获取并存储配置
 
-**文件**: `frontend/src/api/index.js:162-170`
+**文件**: `frontend/src/api/index.js`
 
 ```javascript
-export const getSubscribers = async (params) => http.get(
-  '/api/subscribers',
+-- 获取服务器配置
+export const getConfig = async (params) => http.get(
+  '/api/config',
   {
-    params,
-    loading: models.subscribers,
-    store: models.subscribers,
-    // 特殊处理：attribs 的键名不转换为驼峰命名
-    camelCase: (keyPath) => !keyPath.startsWith('.results.*.attribs'),
+    loading: models.serverConfig,
+    store: models.serverConfig,  -- 存储到 Vuex store
   },
 );
 ```
 
-**关键设计**:
-- `attribs` 对象的键名保持原样，不进行驼峰转换
-- 这确保了用户定义的键名（如 `spoken_languages`）在前端保持不变
+**文件**: `frontend/src/store/index.js`
+
+```javascript
+export default new Vuex.Store({
+  state: {
+    -- 所有模型数据，包括 serverConfig
+    ...Object.keys(models).reduce((obj, cur) => ({ ...obj, [cur]: [] }), {}),
+    
+    loading: Object.keys(models).reduce((obj, cur) => ({ ...obj, [cur]: false }), {}),
+  },
+
+  mutations: {
+    setModelResponse(state, { model, data }) {
+      state[model] = data;
+    },
+    -- ...
+  },
+  -- ...
+});
+```
+
+#### 步骤 4：Forms.vue 渲染表单 HTML
+
+**文件**: `frontend/src/views/Forms.vue:69-111`
+
+```javascript
+methods: {
+  renderHTML() {
+    let h = `<form method="post" action="${this.serverConfig.root_url}/subscription/form" class="listmonk-form">\n`
+      + '  <div>\n'
+      + `    <h3>${this.$t('public.sub')}</h3>\n`
+      + '    <input type="hidden" name="nonce" />\n\n'
+      + `    <p><input type="email" name="email" required placeholder="${this.$t('subscribers.email')}" /></p>\n`
+      + `    <p><input type="text" name="name" placeholder="${this.$t('public.subName')}" /></p>\n\n`;
+
+    -- 动态生成列表 checkbox（基于用户勾选的 publicLists）
+    this.checked.forEach((i) => {
+      const l = this.publicLists[parseInt(i, 10)];
+
+      h += '    <p>\n'
+        + `      <input id="${l.uuid.substr(0, 5)}" type="checkbox" name="l" checked value="${l.uuid}" />\n`
+        + `      <label for="${l.uuid.substr(0, 5)}">${l.name}</label>\n`;
+
+      if (l.description) {
+        h += '      <br />\n'
+          + `      <span>${l.description}</span>\n`;
+      }
+
+      h += '    </p>\n';
+    });
+
+    -- 条件性添加验证码（基于 serverConfig 配置）
+    if (this.serverConfig.public_subscription.captcha_enabled) {
+      if (this.serverConfig.public_subscription.captcha_provider === 'altcha') {
+        h += '\n'
+          + `    <altcha-widget challengeurl="${this.serverConfig.root_url}/api/public/captcha/altcha"></altcha-widget>\n`
+          + `    <${'script'} type="module" src="${this.serverConfig.root_url}/public/static/altcha.umd.js" async defer></${'script'}>\n`;
+      } else if (this.serverConfig.public_subscription.captcha_provider === 'hcaptcha') {
+        h += '\n'
+          + `    <div class="h-captcha" data-sitekey="${this.serverConfig.public_subscription.captcha_key}"></div>\n`
+          + `    <${'script'} src="https://js.hcaptcha.com/1/api.js" async defer></${'script'}>\n`;
+      }
+    }
+
+    h += '\n'
+      + `    <input type="submit" value="${this.$t('public.sub')} " />\n`
+      + '  </div>\n'
+      + '</form>';
+
+    this.html = h;
+  },
+},
+```
+
+### 2.3 完整数据流向图
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│                    Forms.vue 表单生成数据流                                        │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │                      存储层：数据库                                         │  │
+│  │  ┌──────────────┐              ┌──────────────┐                          │  │
+│  │  │  settings 表  │              │  lists 表    │                          │  │
+│  │  │ (JSONB存储)   │              │ (邮件列表)    │                          │  │
+│  │  │ - root_url   │              │ - id         │                          │  │
+│  │  │ - enable_... │              │ - uuid       │                          │  │
+│  │  │ - captcha_*  │              │ - name       │                          │  │
+│  │  └──────┬───────┘              │ - type       │                          │  │
+│  │         │                        │ - description│                          │  │
+│  │         │                        └──────┬───────┘                          │  │
+│  │         │                               │                                  │  │
+│  └─────────┼───────────────────────────────┼──────────────────────────────────┘  │
+│            │                               │                                     │
+│            ▼                               ▼                                     │
+│  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │                      后端：配置加载与 API                                   │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │ initSettings() - 从数据库加载配置到 koanf                              │  │  │
+│  │  │ initConstConfig() - 解析配置到 Config 结构                            │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  │                                    │                                         │  │
+│  │                                    ▼                                         │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │ GetServerConfig() - GET /api/config                                    │  │  │
+│  │  │  返回:                                                                  │  │  │
+│  │  │  - root_url                                                            │  │  │
+│  │  │  - public_subscription.enabled                                         │  │  │
+│  │  │  - public_subscription.captcha_enabled                                 │  │  │
+│  │  │  - public_subscription.captcha_provider                                │  │  │
+│  │  │  - public_subscription.captcha_key                                     │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                                 │
+│                                    ▼                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │                      前端：Vuex 状态管理                                      │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │ getConfig() - 调用 /api/config                                        │  │  │
+│  │  │ getLists() - 调用 /api/lists                                          │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  │                                    │                                         │  │
+│  │                                    ▼                                         │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │ setModelResponse() - 存储到 Vuex store                                 │  │  │
+│  │  │  state.serverConfig = {...}                                            │  │  │
+│  │  │  state.lists = {results: [...]}                                        │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                    │                                                 │
+│                                    ▼                                                 │
+│  ┌─────────────────────────────────────────────────────────────────────────────┐  │
+│  │                      Forms.vue：表单生成                                       │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │ computed: {                                                           │  │  │
+│  │  │   publicLists() {                                                      │  │  │
+│  │  │     return this.lists.results.filter(l => l.type === 'public')        │  │  │
+│  │  │   }                                                                     │  │  │
+│  │  │ }                                                                       │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  │                                    │                                         │  │
+│  │                                    ▼                                         │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │ watch: {                                                              │  │  │
+│  │  │   checked() {                                                          │  │  │
+│  │  │     this.renderHTML()  // 用户勾选列表变化时重新生成                     │  │  │
+│  │  │   }                                                                     │  │  │
+│  │  │ }                                                                       │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  │                                    │                                         │  │
+│  │                                    ▼                                         │  │
+│  │  ┌─────────────────────────────────────────────────────────────────────┐  │  │
+│  │  │ renderHTML() - 硬编码生成 HTML 字符串                                  │  │  │
+│  │  │                                                                         │  │  │
+│  │  │  固定字段（硬编码）：                                                    │  │  │
+│  │  │  - <input type="email" name="email">                                  │  │  │
+│  │  │  - <input type="text" name="name">                                    │  │  │
+│  │  │                                                                         │  │  │
+│  │  │  动态部分（基于配置和选择）：                                             │  │  │
+│  │  │  - 列表 checkbox：循环 publicLists                                     │  │  │
+│  │  │  - 验证码：基于 serverConfig 条件添加                                   │  │  │
+│  │  │                                                                         │  │  │
+│  │  │  ⚠️ 没有自定义字段渲染！                                                 │  │  │
+│  │  └─────────────────────────────────────────────────────────────────────┘  │  │
+│  └──────────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
 
 ---
 
-## 三、前端表单处理机制
+## 三、为什么这条链路不属于自定义字段 Schema 动态渲染
 
-### 3.1 管理后台订阅者表单
+### 3.1 核心区别对比
+
+| 维度 | Forms.vue 表单生成 | 自定义字段 Schema 动态渲染 |
+|------|-------------------|---------------------------|
+| **设计目标** | 生成可嵌入的 HTML 表单代码 | 定义和渲染自定义数据字段 |
+| **数据来源** | 邮件列表配置 + 服务器全局配置 | 字段定义 Schema |
+| **字段定义** | 硬编码（email, name, lists, captcha） | 动态从 schema 读取 |
+| **字段类型** | 固定类型（email, text, checkbox） | 支持多种类型（string, number, select, radio, date 等） |
+| **元数据存储** | 无独立存储，直接使用现有配置 | 需要独立的字段定义表 |
+| **数据验证** | 无字段级别验证（仅 HTML 属性） | 基于 schema 的类型/规则验证 |
+| **与 attribs 关联** | ❌ 完全无关 | ✅ 直接映射到 attribs 字段 |
+
+### 3.2 详细分析
+
+#### 3.2.1 没有独立的字段定义存储
+
+**当前 Forms.vue 使用的数据来源**：
+1. **`lists` 表** - 邮件列表数据，用于生成 checkbox
+2. **`settings` 表** - 全局配置，如 `root_url`、`captcha_enabled` 等
+
+**真正的自定义字段 Schema 系统需要**：
+```sql
+-- 需要独立的字段定义表
+CREATE TABLE subscriber_fields (
+    id          SERIAL PRIMARY KEY,
+    key         VARCHAR(100) NOT NULL UNIQUE,  -- 字段键名（如 "city"）
+    name        VARCHAR(200) NOT NULL,          -- 显示名称（如 "城市"）
+    type        VARCHAR(50) NOT NULL,           -- 类型: string, number, boolean, select, date
+    required    BOOLEAN NOT NULL DEFAULT false,  -- 是否必填
+    options     JSONB,                           -- 选项（用于 select 类型）
+    default_val JSONB,                           -- 默认值
+    validation  JSONB,                           -- 验证规则
+    sort_order  INTEGER NOT NULL DEFAULT 0,      -- 排序
+    is_public   BOOLEAN NOT NULL DEFAULT false,  -- 是否在公共表单显示
+    status      VARCHAR(20) NOT NULL DEFAULT 'active'
+);
+```
+
+#### 3.2.2 字段是硬编码的，不是动态渲染
+
+**Forms.vue 中的硬编码字段** (`frontend/src/views/Forms.vue:69-90`)：
+
+```javascript
+renderHTML() {
+  -- 硬编码的固定字段
+  let h = `...
+    <input type="email" name="email" required placeholder="...">  -- 硬编码
+    <input type="text" name="name" placeholder="...">              -- 硬编码
+  `;
+
+  -- 只有列表 checkbox 是"动态"的，但也是硬编码逻辑
+  this.checked.forEach((i) => {
+    h += `
+      <input type="checkbox" name="l" value="${l.uuid}">  -- 硬编码为 checkbox
+      <label>${l.name}</label>
+    `;
+  });
+
+  -- 验证码也是硬编码逻辑
+  if (this.serverConfig.public_subscription.captcha_enabled) {
+    h += `<altcha-widget ...>`;  -- 硬编码
+  }
+}
+```
+
+**真正的动态渲染应该是**：
+
+```javascript
+-- 伪代码：基于 schema 动态渲染
+renderDynamicFields(fields) {
+  return fields
+    .filter(f => f.is_public)
+    .sort((a, b) => a.sort_order - b.sort_order)
+    .map(field => {
+      switch (field.type) {
+        case 'string':
+          return `<input type="text" name="${field.key}" 
+            ${field.required ? 'required' : ''} 
+            placeholder="${field.name}">`;
+        case 'number':
+          return `<input type="number" name="${field.key}" ...>`;
+        case 'boolean':
+          return `<input type="checkbox" name="${field.key}">`;
+        case 'select':
+          return `<select name="${field.key}">
+            ${field.options.map(opt => `<option value="${opt.value}">${opt.label}</option>`).join('')}
+          </select>`;
+        case 'radio':
+          return field.options.map(opt => 
+            `<input type="radio" name="${field.key}" value="${opt.value}">${opt.label}`
+          ).join('');
+        -- ... 更多类型
+      }
+    });
+}
+```
+
+#### 3.2.3 与订阅者属性（attribs）完全无关
+
+**关键区别**：
+- **Forms.vue 生成的字段**：
+  - `email` → 映射到 `subscribers.email`
+  - `name` → 映射到 `subscribers.name`
+  - `l` (列表) → 映射到 `subscriber_lists` 关联表
+  - **没有任何字段映射到 `attribs`！**
+
+- **真正的自定义字段系统**：
+  - 每个字段定义直接映射到 `attribs` 中的一个键
+  - 例如：字段定义 `{key: "city", type: "string"}` → `attribs.city`
+
+#### 3.2.4 没有元数据和验证
+
+**Forms.vue 的限制**：
+- 不知道字段类型（无法做类型转换）
+- 不知道验证规则（无法在前端做验证）
+- 不知道默认值（无法预填）
+- 不知道排序顺序（无法按配置顺序排列）
+
+**真正的 Schema 系统包含**：
+```json
+{
+  "key": "age",
+  "name": "年龄",
+  "type": "number",
+  "required": true,
+  "default_val": 18,
+  "validation": {
+    "min": 0,
+    "max": 150,
+    "pattern": null
+  },
+  "sort_order": 3,
+  "is_public": true
+}
+```
+
+### 3.3 图示对比
+
+```
+┌─────────────────────────────────────────────────────────────────────────────────┐
+│              Forms.vue 表单生成 vs 自定义字段 Schema 渲染                          │
+├─────────────────────────────────────────────────────────────────────────────────┤
+│                                                                                  │
+│  Forms.vue 表单生成（当前实现）                                                   │
+│  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                           │  │
+│  │  ┌──────────┐    ┌──────────┐    ┌─────────────────────────────────┐  │  │
+│  │  │ lists 表 │    │ settings │    │        硬编码 HTML 模板           │  │  │
+│  │  │ (邮件列表)│    │ (全局配置)│    │  ┌───────────────────────────┐  │  │  │
+│  │  └────┬─────┘    └────┬─────┘    │  │ email: <input type="email">│  │  │  │
+│  │       │               │          │  │ name:  <input type="text"> │  │  │  │
+│  │       ▼               ▼          │  │ lists: <checkbox x N>       │  │  │  │
+│  │  ┌──────────────────────────┐    │  │ captcha: (条件性添加)        │  │  │  │
+│  │  │     renderHTML()         │    │  └───────────────────────────┘  │  │  │
+│  │  │  (硬编码字符串拼接)       │    └─────────────────────────────────┘  │  │
+│  │  └────────────┬─────────────┘                                         │  │
+│  │               │                                                          │  │
+│  │               ▼                                                          │  │
+│  │  ┌─────────────────────────────────────────────────────────────────┐  │  │
+│  │  │  输出: HTML 字符串（可嵌入到外部网站）                              │  │  │
+│  │  │  ⚠️ 与 attribs 无关，无法设置自定义属性                              │  │  │
+│  │  └─────────────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                  │
+│  ─────────────────────────────────────────────────────────────────────────────  │
+│                                                                                  │
+│  自定义字段 Schema 渲染（理想实现）                                                │
+│  ┌─────────────────────────────────────────────────────────────────────────┐  │
+│  │                                                                           │  │
+│  │  ┌──────────────────────────────────────────────────────────────────┐  │  │
+│  │  │                subscriber_fields 表（字段定义 Schema）             │  │  │
+│  │  │  ┌────────────────────────────────────────────────────────────┐  │  │  │
+│  │  │  │ key     │ name │ type   │ required │ options │ sort_order │  │  │  │
+│  │  │  ├─────────┼──────┼────────┼──────────┼─────────┼────────────┤  │  │  │
+│  │  │  │ city    │ 城市 │ string │ false    │ null    │ 1          │  │  │  │
+│  │  │  │ company │ 公司 │ string │ true     │ null    │ 2          │  │  │  │
+│  │  │  │ role    │ 角色 │ select │ false    │ {...}   │ 3          │  │  │  │
+│  │  │  │ vip     │ 会员 │ boolean│ false    │ null    │ 4          │  │  │  │
+│  │  │  └─────────┴──────┴────────┴──────────┴─────────┴────────────┘  │  │  │
+│  │  └──────────────────────────────────────────────────────────────────┘  │  │
+│  │                                     │                                     │  │
+│  │                                     ▼                                     │  │
+│  │  ┌──────────────────────────────────────────────────────────────────┐  │  │
+│  │  │                    动态渲染引擎                                      │  │  │
+│  │  │  - 按 type 选择输入组件 (text, number, select, checkbox...)        │  │  │
+│  │  │  - 按 sort_order 排序                                                │  │  │
+│  │  │  - 应用 validation 规则                                              │  │  │
+│  │  │  - 处理 default_val 默认值                                           │  │  │
+│  │  └──────────────────────────────────────────────────────────────────┘  │  │
+│  │                                     │                                     │  │
+│  │                                     ▼                                     │  │
+│  │  ┌──────────────────────────────────────────────────────────────────┐  │  │
+│  │  │                    数据映射                                          │  │  │
+│  │  │  表单字段值  ──────►  subscribers.attribs                          │  │  │
+│  │  │  city: "北京"   ──────►  {"city": "北京", ...}                    │  │  │
+│  │  │  vip: true     ──────►  {"vip": true, ...}                        │  │  │
+│  │  └──────────────────────────────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────────────────────────────────┘  │
+│                                                                                  │
+└─────────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## 四、前端表单处理机制
+
+### 4.1 管理后台订阅者表单
 
 **文件**: `frontend/src/views/SubscriberForm.vue`
 
 #### 模板部分
+
 ```vue
 <b-field :message="$t('subscribers.attribsHelp') + ' ' + egAttribs" class="mt-6">
   <div>
@@ -239,6 +606,7 @@ export const getSubscribers = async (params) => http.get(
 ```
 
 #### 数据处理逻辑
+
 ```javascript
 data() {
   return {
@@ -272,7 +640,7 @@ methods: {
     };
 
     this.$api.createSubscriber(data).then((d) => {
-      // ...
+      -- ...
     });
   },
 
@@ -303,7 +671,7 @@ methods: {
 - 提供示例 `egAttribs` 帮助用户理解格式
 - **没有基于 schema 的字段验证**（如类型检查、必填验证等）
 
-### 3.2 公共订阅表单
+### 4.2 公共订阅表单
 
 **文件**: `static/public/templates/subscription-form.html`
 
@@ -319,7 +687,7 @@ methods: {
       <input id="name" name="name" type="text" ...>
     </p>
 
-    <!-- 邮件列表选择 -->
+    -- 邮件列表选择
     <ul class="lists">
       {{ range $i, $l := .Data.Lists }}
         <li>
@@ -329,7 +697,7 @@ methods: {
       {{ end }}
     </ul>
 
-    <!-- 验证码（如果启用） -->
+    -- 验证码（如果启用）
     {{ if .Data.Captcha.Enabled }}
       <div class="captcha">...</div>
     {{ end }}
@@ -351,7 +719,7 @@ methods: {
 - **没有自定义字段输入** - 公共订阅表单不支持输入 `attribs` 数据
 - **没有动态渲染机制** - 表单字段是硬编码的，无法基于配置动态生成
 
-### 3.3 公共订阅表单后端处理
+### 4.3 公共订阅表单后端处理
 
 **文件**: `cmd/public.go:706-788`
 
@@ -361,31 +729,144 @@ func (a *App) processSubForm(c echo.Context) (bool, error) {
         Name          string   `form:"name" json:"name"`
         Email         string   `form:"email" json:"email"`
         FormListUUIDs []string `form:"l" json:"list_uuids"`
-        // ⚠️ 注意：没有 attribs 字段！
+        -- ⚠️ 注意：没有 attribs 字段！
     }
     if err := c.Bind(&req); err != nil {
         return false, err
     }
 
-    // ... 验证代码 ...
+    -- ... 验证代码 ...
 
-    // 插入订阅者时，attribs 为空
+    -- 插入订阅者时，attribs 为空
     _, hasOptin, err := a.core.InsertSubscriber(models.Subscriber{
         Name:   req.Name,
         Email:  req.Email,
         Status: models.SubscriberStatusEnabled,
-        // ⚠️ 没有设置 Attribs！
+        -- ⚠️ 没有设置 Attribs！
     }, nil, listUUIDs, false, true)
     
-    // ...
+    -- ...
 }
 ```
 
 ---
 
-## 四、属性的使用场景
+## 五、数据传输流程
 
-### 4.1 查询与分段
+### 5.1 API 接口定义
+
+#### 创建订阅者
+
+**文件**: `docs/docs/content/apis/subscribers.md:300-340`
+
+```json
+-- POST /api/subscribers
+{
+  "email": "subscriber@domain.com",
+  "name": "The Subscriber",
+  "status": "enabled",
+  "lists": [1],
+  "attribs": {
+    "city": "Bengaluru",
+    "projects": 3,
+    "stack": { "languages": ["go", "python"] }
+  }
+}
+```
+
+#### 公共订阅 API
+
+**文件**: `docs/docs/content/apis/subscribers.md:364-398`
+
+```json
+-- POST /api/public/subscription
+{
+  "email": "subscriber@domain.com",
+  "name": "The Subscriber",
+  "list_uuids": ["eb420c55-4cfb-4972-92ba-c93c34ba475d"]
+  -- ⚠️ 注意：此接口不支持直接传入 attribs
+}
+```
+
+### 5.2 后端处理逻辑
+
+#### 创建订阅者处理
+
+**文件**: `internal/core/subscribers.go:286-349`
+
+```go
+func (c *Core) InsertSubscriber(sub models.Subscriber, listIDs []int, listUUIDs []string, preconfirm, assertOptin bool) (models.Subscriber, bool, error) {
+    -- ... 省略前置代码 ...
+    
+    -- 直接将 sub.Attribs 存入数据库
+    if err = c.q.InsertSubscriber.Get(&sub.ID,
+        sub.UUID,
+        sub.Email,
+        strings.TrimSpace(sub.Name),
+        sub.Status,
+        sub.Attribs,  -- 直接传入，无 schema 验证
+        pq.Array(listIDs),
+        pq.Array(listUUIDs),
+        subStatus); err != nil {
+        -- ... 错误处理 ...
+    }
+    
+    -- ... 省略后续代码 ...
+}
+```
+
+#### 更新订阅者处理
+
+**文件**: `internal/core/subscribers.go:352-383`
+
+```go
+func (c *Core) UpdateSubscriber(id int, sub models.Subscriber) (models.Subscriber, error) {
+    -- 格式化 JSON 属性
+    attribs := []byte("{}")
+    if len(sub.Attribs) > 0 {
+        if b, err := json.Marshal(sub.Attribs); err != nil {
+            return models.Subscriber{}, echo.NewHTTPError(...)
+        } else {
+            attribs = b
+        }
+    }
+
+    _, err := c.q.UpdateSubscriber.Exec(id,
+        sub.Email,
+        strings.TrimSpace(sub.Name),
+        sub.Status,
+        json.RawMessage(attribs),  -- 序列化为 JSON 存储
+    )
+    -- ...
+}
+```
+
+### 5.3 前端 API 层
+
+**文件**: `frontend/src/api/index.js:162-170`
+
+```javascript
+export const getSubscribers = async (params) => http.get(
+  '/api/subscribers',
+  {
+    params,
+    loading: models.subscribers,
+    store: models.subscribers,
+    -- 特殊处理：attribs 的键名不转换为驼峰命名
+    camelCase: (keyPath) => !keyPath.startsWith('.results.*.attribs'),
+  },
+);
+```
+
+**关键设计**:
+- `attribs` 对象的键名保持原样，不进行驼峰转换
+- 这确保了用户定义的键名（如 `spoken_languages`）在前端保持不变
+
+---
+
+## 六、属性的使用场景
+
+### 6.1 查询与分段
 
 **文件**: `docs/docs/content/apis/subscribers.md:55`
 
@@ -396,12 +877,12 @@ curl -u 'api_username:access_token' -X GET 'http://localhost:9000/api/subscriber
     --url-query "query=subscribers.name LIKE 'Test%' AND subscribers.attribs->>'city' = 'Bengaluru'"
 ```
 
-### 4.2 邮件模板渲染
+### 6.2 邮件模板渲染
 
 属性可以在邮件模板中使用：
 
 ```html
-<!-- 模板示例 -->
+-- 模板示例
 <p>Hello {{ .Subscriber.Name }},</p>
 <p>You are from {{ .Subscriber.Attribs.city }}.</p>
 {{ if .Subscriber.Attribs.likes_tea }}
@@ -409,15 +890,15 @@ curl -u 'api_username:access_token' -X GET 'http://localhost:9000/api/subscriber
 {{ end }}
 ```
 
-### 4.3 管理后台查看
+### 6.3 管理后台查看
 
 在订阅者详情页面，可以查看和编辑属性的 JSON 数据。
 
 ---
 
-## 五、数据流总结
+## 七、数据流总结
 
-### 5.1 数据流向图
+### 7.1 数据流向图
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
@@ -454,7 +935,7 @@ curl -u 'api_username:access_token' -X GET 'http://localhost:9000/api/subscriber
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-### 5.2 与"理想"动态表单系统的对比
+### 7.2 与"理想"动态表单系统的对比
 
 | 特性 | listmonk 当前实现 | 理想的动态表单系统 |
 |------|------------------|-------------------|
@@ -466,9 +947,9 @@ curl -u 'api_username:access_token' -X GET 'http://localhost:9000/api/subscriber
 
 ---
 
-## 六、API 端点与属性相关的处理
+## 八、API 端点与属性相关的处理
 
-### 6.1 管理 API
+### 8.1 管理 API
 
 | 端点 | 方法 | 支持 attribs | 说明 |
 |------|------|-------------|------|
@@ -478,7 +959,7 @@ curl -u 'api_username:access_token' -X GET 'http://localhost:9000/api/subscriber
 | `/api/subscribers` | GET | ✅ | 返回包含属性的订阅者数据 |
 | `/api/subscribers/{id}` | GET | ✅ | 返回单个订阅者的属性 |
 
-### 6.2 公共 API
+### 8.2 公共 API
 
 | 端点 | 方法 | 支持 attribs | 说明 |
 |------|------|-------------|------|
@@ -487,11 +968,11 @@ curl -u 'api_username:access_token' -X GET 'http://localhost:9000/api/subscriber
 
 ---
 
-## 七、扩展建议
+## 九、扩展建议
 
 如果需要实现"自定义字段 schema 驱动订阅表单动态渲染"，可以考虑以下扩展方案：
 
-### 7.1 数据库扩展
+### 9.1 数据库扩展
 
 ```sql
 -- 新增字段定义表
@@ -513,7 +994,7 @@ CREATE TABLE subscriber_fields (
 );
 ```
 
-### 7.2 后端模型扩展
+### 9.2 后端模型扩展
 
 ```go
 type SubscriberField struct {
@@ -531,10 +1012,10 @@ type SubscriberField struct {
 }
 ```
 
-### 7.3 表单渲染逻辑
+### 9.3 表单渲染逻辑
 
 ```javascript
-// 伪代码：基于 schema 动态渲染表单
+-- 伪代码：基于 schema 动态渲染表单
 function renderFormFields(fields) {
   return fields
     .filter(f => f.is_public)
@@ -551,7 +1032,7 @@ function renderFormFields(fields) {
           return `<select name="${field.key}" ${field.required ? 'required' : ''}>
             ${field.options.map(opt => `<option value="${opt.value}">${opt.label}</option>`).join('')}
           </select>`;
-        // ... 更多类型
+        -- ... 更多类型
       }
     });
 }
@@ -559,16 +1040,17 @@ function renderFormFields(fields) {
 
 ---
 
-## 八、总结
+## 十、总结
 
-### 8.1 当前系统的特点
+### 10.1 当前系统的特点
 
 1. **简单灵活**：`attribs` 作为自由格式 JSON，支持任意嵌套结构
 2. **功能受限**：没有 schema 约束，无法进行类型安全验证
 3. **公共表单不支持**：用户无法通过公共订阅表单提交自定义属性
 4. **管理后台体验差**：需要手动编辑 JSON，容易出错
+5. **Forms.vue 不是 Schema 系统**：它只是生成可嵌入的 HTML 代码，与自定义字段无关
 
-### 8.2 使用场景建议
+### 10.2 使用场景建议
 
 当前的实现适合以下场景：
 - 开发人员通过 API 集成外部系统
@@ -580,7 +1062,7 @@ function renderFormFields(fields) {
 - 需要严格的数据验证和类型约束
 - 需要动态配置表单字段的 SaaS 平台
 
-### 8.3 关键文件索引
+### 10.3 关键文件索引
 
 | 文件路径 | 说明 |
 |---------|------|
@@ -590,8 +1072,12 @@ function renderFormFields(fields) {
 | `internal/core/subscribers.go` | 订阅者核心业务逻辑 |
 | `cmd/subscribers.go` | 订阅者 API 处理层 |
 | `cmd/public.go:706-788` | 公共订阅表单处理 |
+| `cmd/admin.go:41-91` | GetServerConfig 配置下发 API |
+| `cmd/init.go:431-454` | initSettings 从数据库加载配置 |
+| `frontend/src/views/Forms.vue` | 表单代码生成页面（非 schema 系统） |
 | `frontend/src/views/SubscriberForm.vue` | 管理后台订阅者表单 |
-| `frontend/src/api/index.js:162-170` | 前端 API 定义（含 camelCase 特殊处理） |
+| `frontend/src/api/index.js` | 前端 API 定义 |
+| `frontend/src/store/index.js` | Vuex 状态管理 |
 | `static/public/templates/subscription-form.html` | 公共订阅表单模板 |
 
 ---
@@ -605,6 +1091,7 @@ curl -u 'api_username:access_token' 'http://localhost:9000/api/subscribers/1'
 ```
 
 响应：
+
 ```json
 {
   "data": {
