@@ -820,21 +820,519 @@ c.Tpl = out
 
 ## 八、变量缺失与错误处理
 
-### 8.1 Go 模板的默认行为
+### 8.1 模板编译时的 Option 配置
 
-Listmonk 使用标准 `html/template` 包，**未设置 `missingkey=error` 选项**，因此对缺失变量的默认行为是：
+**关键发现**：Listmonk 没有调用 `template.Option()` 方法，使用 Go 模板的**默认行为**。
 
-| 缺失情况 | 行为 | 输出示例 |
-|----------|------|----------|
-| 结构体字段不存在 | 输出 `<no value>` 或空字符串 | `{{ .Subscriber.NonExistent }}` → `` |
-| Map 键不存在 | 输出零值（空字符串） | `{{ .Subscriber.Attribs.unknown }}` → `` |
-| 方法不存在 | 编译错误 | - |
-| 函数不存在 | 编译错误 | - |
+**代码证据**（所有模板编译位置）：
 
-**注意**：Listmonk 没有使用 `template.Option("missingkey=error")`，这意味着：
-- 模板不会因访问不存在的字段而崩溃
-- 缺失字段会静默输出空值
-- 这种设计有利于模板的灵活性，但可能隐藏错误
+| 模板类型 | 编译代码 | 文件位置 |
+|----------|----------|----------|
+| 活动主体模板 | `template.New(BaseTpl).Funcs(f).Parse(body)` | `models/campaigns.go:168` |
+| 活动主题模板 | `txttpl.New(ContentTpl).Funcs(txtFuncs).Parse(subj)` | `models/campaigns.go:150` |
+| 事务邮件模板 | `template.New(BaseTpl).Funcs(f).Parse(t.Body)` | `models/templates.go:40` |
+| 活动纯文本模板 | `template.New(ContentTpl).Funcs(f).Parse(b)` | `models/campaigns.go:205` |
+
+**所有编译都没有调用 `.Option()`**，因此：
+- 没有设置 `missingkey=error`
+- 没有设置 `missingkey=zero`
+- 使用 Go 模板的**默认行为**（`missingkey=default` 或 `missingkey=invalid`）
+
+### 8.2 Go 模板 missingkey 选项详解
+
+根据 Go 官方文档（`src/html/template/template.go`），`missingkey` 选项有以下值：
+
+| 选项值 | 行为 | 输出示例 |
+|--------|------|----------|
+| `missingkey=default` 或 `missingkey=invalid` | **默认行为**：继续执行，打印 `<no value>` | `{{ .UnknownKey }}` → `<no value>` |
+| `missingkey=zero` | 返回 map 元素类型的零值 | `{{ .UnknownKey }}` → ``（空字符串） |
+| `missingkey=error` | 执行立即停止并报错 | 执行时 panic 或返回 error |
+
+### 8.3 变量缺失行为对照表
+
+基于 Listmonk 的代码结构和 Go 模板的默认行为，以下是完整的对照表：
+
+#### 8.3.1 编译期错误（Compile-time Errors）
+
+这些错误在 `template.Parse()` 阶段检测，**模板无法编译**。
+
+| 错误类型 | 触发条件 | 示例代码 | 错误信息示例 | 代码证据位置 |
+|----------|----------|----------|--------------|--------------|
+| **语法错误** | 模板语法不合法 | `{{ .Subscriber.Name` | `parse error: unclosed action` | `models/campaigns.go:168` |
+| **函数不存在** | 调用未在 `Funcs()` 中注册的函数 | `{{ NonExistentFunc }}` | `function "NonExistentFunc" not defined` | `models/campaigns.go:168` |
+| **结构体字段不存在** | 访问结构体中未定义的字段 | `{{ .Subscriber.NonExistentField }}` | `can't evaluate field NonExistentField in type models.Subscriber` | `models/campaigns.go:168` |
+| **结构体方法不存在** | 调用结构体中未定义的方法 | `{{ .Subscriber.NonExistentMethod }}` | `can't evaluate method NonExistentMethod in type models.Subscriber` | `models/campaigns.go:168` |
+| **管道错误** | 管道操作符使用错误 | `{{ .Name | NonExistentFunc }}` | `function "NonExistentFunc" not defined` | `models/campaigns.go:168` |
+
+**关键理解**：
+- 对于**结构体类型**（如 `Subscriber`, `Campaign`, `CampaignMessage`），Go 模板在**编译时**检查字段和方法是否存在
+- 对于 **map 类型**（如 `Subscriber.Attribs`, `Tx.Data`），检查发生在**执行时**
+
+#### 8.3.2 执行期行为（Runtime Behavior）
+
+这些行为在 `template.Execute()` 阶段发生，**模板已成功编译**。
+
+| 行为类型 | 触发条件 | 示例代码 | 实际输出 | 说明 |
+|----------|----------|----------|----------|------|
+| **Map 键不存在** | 访问 map 中不存在的 key | `{{ .Subscriber.Attribs.unknownKey }}` | `<no value>` | 默认行为，不报错 |
+| **Map 嵌套键不存在** | 嵌套访问 map 中不存在的 key | `{{ .Subscriber.Attribs.profile.city }}` | `<no value>` | 同上 |
+| **Tx.Data 键不存在** | 事务邮件自定义数据中不存在的 key | `{{ .Tx.Data.nonExistent }}` | `<no value>` | 同上 |
+| **nil 指针引用** | 访问 nil 指针的字段 | 极少发生 | panic | Listmonk 确保上下文有效 |
+| **类型断言/转换错误** | 函数参数类型不匹配 | `{{ add .Subscriber.Name 1 }}` | 执行时错误 | Name 是字符串，不能相加 |
+
+**注意**：
+- `<no value>` 是 `text/template` 的默认输出
+- `html/template` 可能会将 `<no value>` 转义为 `&lt;no value&gt;`
+- 存在一个已知问题：`text/template` 和 `html/template` 在 `missingkey=zero` 时行为不同，但 Listmonk 使用默认行为，所以统一输出 `<no value>`
+
+### 8.4 深入分析：结构体 vs Map 的差异
+
+#### 8.4.1 结构体字段访问（编译期检查）
+
+**代码证据**：Listmonk 的上下文结构体
+
+```go
+// 活动邮件上下文
+type CampaignMessage struct {
+    Campaign   *models.Campaign   // 指针类型，结构体
+    Subscriber models.Subscriber  // 值类型，结构体
+    // ...
+}
+
+// 订阅者结构体
+type Subscriber struct {
+    Base
+    UUID    string         // 字段：编译时检查
+    Email   string         // 字段：编译时检查
+    Name    string         // 字段：编译时检查
+    Attribs JSON           // map 类型：执行时检查
+    Status  string         // 字段：编译时检查
+    // ...
+}
+```
+
+**编译时检查示例**：
+
+| 模板表达式 | 检查阶段 | 结果 |
+|------------|----------|------|
+| `{{ .Subscriber.Name }}` | 编译期 | 成功（字段存在） |
+| `{{ .Subscriber.NonExistent }}` | 编译期 | **错误**（字段不存在） |
+| `{{ .Subscriber.Attribs }}` | 编译期 | 成功（Attribs 是字段） |
+| `{{ .Subscriber.Attribs.city }}` | 执行期 | 成功或 `<no value>`（取决于 map 是否有 key） |
+| `{{ .Subscriber.FirstName }}` | 编译期 | 成功（方法存在） |
+| `{{ .Subscriber.NonExistentMethod }}` | 编译期 | **错误**（方法不存在） |
+
+#### 8.4.2 Map 键访问（执行期检查）
+
+**代码证据**：Listmonk 中的 map 类型
+
+```go
+// Subscriber.Attribs 是 map 类型
+type JSON map[string]any  // models/common.go 中定义
+
+// Tx.Data 也是 map 类型
+type TxMessage struct {
+    Data             map[string]any   // 自定义数据
+    // ...
+}
+```
+
+**执行期行为示例**：
+
+假设 `.Subscriber.Attribs = map[string]any{"city": "北京", "age": 30}`
+
+| 模板表达式 | map 中是否有 key | 输出 | 是否报错 |
+|------------|------------------|------|----------|
+| `{{ .Subscriber.Attribs.city }}` | 是 | `北京` | 否 |
+| `{{ .Subscriber.Attribs.unknown }}` | 否 | `<no value>` | **否**（继续执行） |
+| `{{ .Subscriber.Attribs.age }}` | 是 | `30` | 否 |
+
+### 8.5 编译期错误的服务端处理路径
+
+#### 8.5.1 活动开始时的编译错误
+
+**调用路径**：
+```
+scanCampaigns()  →  检测到 running 状态的活动
+       ↓
+newPipe(campaign)  →  创建发送管道
+       ↓
+c.CompileTemplate(...)  →  编译模板
+       ↓
+返回错误  →  活动无法启动
+```
+
+**代码证据** (`internal/manager/pipe.go:27-42`)：
+```go
+func (m *Manager) newPipe(c *models.Campaign) (*pipe, error) {
+    // 验证 messenger 配置...
+    
+    // 编译模板
+    if err := c.CompileTemplate(m.TemplateFuncs(c)); err != nil {
+        return nil, err  // 直接返回错误，活动不会开始
+    }
+    
+    // 加载附件...
+    // ...
+}
+```
+
+**实际行为**：
+- 活动保持 `running` 状态但无法开始发送
+- 错误被记录到日志
+- 需要管理员修复模板
+
+#### 8.5.2 预览时的编译错误
+
+**调用路径**：
+```
+PreviewCampaign API  →  GET /api/campaigns/:id/preview
+       ↓
+camp.CompileTemplate(...)  →  编译模板
+       ↓
+返回 HTTP 400  →  前端显示错误信息
+```
+
+**代码证据** (`cmd/campaigns.go:176-180`)：
+```go
+if err := camp.CompileTemplate(a.manager.TemplateFuncs(&camp)); err != nil {
+    a.log.Printf("error compiling template: %v", err)
+    return echo.NewHTTPError(http.StatusBadRequest,
+        a.i18n.Ts("templates.errorCompiling", "error", err.Error()))
+}
+```
+
+**实际行为**：
+- 返回 HTTP 400 状态码
+- 错误信息包含详细描述（如 `templates.errorCompiling: parse error: ...`）
+- 前端可显示具体错误，帮助用户调试
+
+#### 8.5.3 模板保存时的编译错误
+
+**调用路径**：
+```
+CreateTemplate/UpdateTemplate API
+       ↓
+tpl.Compile(...)  →  编译模板
+       ↓
+返回 HTTP 400  →  保存失败
+```
+
+**代码证据** (`cmd/templates.go` 中)：
+```go
+// 模板保存时编译
+if err := tpl.Compile(a.manager.GenericTemplateFuncs()); err != nil {
+    return echo.NewHTTPError(http.StatusBadRequest,
+        a.i18n.Ts("templates.errorCompiling", "error", err.Error()))
+}
+```
+
+### 8.6 执行期错误的服务端处理路径
+
+#### 8.6.1 活动发送时的渲染错误
+
+**调用路径**：
+```
+NextSubscribers()  →  获取下一批订阅者
+       ↓
+for _, s := range subs {  →  遍历订阅者
+       ↓
+p.newMessage(s)  →  创建消息（触发渲染）
+       ↓
+msg.render()  →  执行模板
+       ↓
+返回错误？  →  记录日志 + continue（跳过当前订阅者）
+       ↓
+继续处理下一个订阅者
+```
+
+**代码证据** (`internal/manager/pipe.go:95-100`)：
+```go
+for _, s := range subs {
+    msg, err := p.newMessage(s)
+    if err != nil {
+        // 记录错误日志
+        p.m.log.Printf("error rendering message (%s) (%s): %v", 
+            p.camp.Name, s.Email, err)
+        // 跳过该订阅者，继续处理下一个
+        continue
+    }
+    // 发送消息...
+}
+```
+
+**关键行为**：
+- **单个订阅者失败不影响其他订阅者**（容错性设计）
+- 错误被记录到日志（包含活动名、订阅者邮箱、错误详情）
+- **不会累加到 `MaxSendErrors` 计数器**（那是发送错误，如 SMTP 错误）
+- 活动继续运行
+
+#### 8.6.2 预览时的渲染错误
+
+**调用路径**：
+```
+PreviewCampaign API
+       ↓
+a.manager.NewCampaignMessage(&camp, dummySubscriber)
+       ↓
+msg.render()  →  执行模板
+       ↓
+返回 HTTP 400  →  显示详细错误
+```
+
+**代码证据** (`cmd/campaigns.go:183-188`)：
+```go
+msg, err := a.manager.NewCampaignMessage(&camp, dummySubscriber)
+if err != nil {
+    a.log.Printf("error rendering message: %v", err)
+    return echo.NewHTTPError(http.StatusBadRequest,
+        a.i18n.Ts("templates.errorRendering", "error", err.Error()))
+}
+```
+
+#### 8.6.3 事务邮件的渲染错误
+
+**调用路径**：
+```
+SendTxMessage API
+       ↓
+m.Render(sub, tpl, funcs)  →  执行模板
+       ↓
+返回 HTTP 400  →  整个请求失败
+```
+
+**代码证据** (`cmd/tx.go:132-135`)：
+```go
+if err := m.Render(sub, tpl, a.manager.GenericTemplateFuncs()); err != nil {
+    return echo.NewHTTPError(http.StatusBadRequest,
+        a.i18n.Ts("globals.messages.errorFetching", "name"))
+}
+```
+
+**注意**：
+- 整个事务邮件请求失败
+- 错误消息较模糊（`errorFetching`），不显示详细错误（安全性考虑）
+
+### 8.7 完整错误处理流程图
+
+```
+┌─────────────────────────────────────────────────────────────────────────┐
+│                        模板生命周期与错误处理                              │
+├─────────────────────────────────────────────────────────────────────────┤
+│                                                                         │
+│  ┌───────────────────────────────────────────────────────────────────┐ │
+│  │                        编译阶段 (Compile-time)                      │ │
+│  └───────────────────────────────────────────────────────────────────┘ │
+│                                    │                                    │
+│                                    ▼                                    │
+│  ┌───────────────────────────────────────────────────────────────────┐ │
+│  │  模板解析 (template.Parse())                                        │ │
+│  │                                                                   │ │
+│  │  检测的错误类型：                                                  │ │
+│  │  ├── 语法错误（缺少 }}、不匹配的引号等）                          │ │
+│  │  ├── 函数不存在（未在 Funcs() 中注册）                            │ │
+│  │  ├── 结构体字段不存在（如 .Subscriber.NonExistent）              │ │
+│  │  └── 结构体方法不存在（如 .Subscriber.NonExistentMethod）        │ │
+│  └───────────────────────────────────────────────────────────────────┘ │
+│                                    │                                    │
+│                    ┌───────────────┴───────────────┐                 │
+│                    │                               │                 │
+│                    ▼                               ▼                 │
+│  ┌──────────────────────────┐    ┌──────────────────────────────┐  │
+│  │       编译成功           │    │         编译失败             │  │
+│  │  继续执行流程            │    │                              │  │
+│  │                          │    │  处理路径：                  │  │
+│  │                          │    │  ├── 活动启动时：返回错误    │  │
+│  │                          │    │  │   活动无法开始            │  │
+│  │                          │    │  │                          │  │
+│  │                          │    │  ├── 预览时：HTTP 400       │  │
+│  │                          │    │  │   显示详细错误           │  │
+│  │                          │    │  │                          │  │
+│  │                          │    │  └── 模板保存时：HTTP 400   │  │
+│  │                          │    │      保存失败                │  │
+│  └──────────────────────────┘    └──────────────────────────────┘  │
+│                                    │                                    │
+│                                    ▼                                    │
+│  ┌───────────────────────────────────────────────────────────────────┐ │
+│  │                        执行阶段 (Runtime)                           │ │
+│  └───────────────────────────────────────────────────────────────────┘ │
+│                                    │                                    │
+│                                    ▼                                    │
+│  ┌───────────────────────────────────────────────────────────────────┐ │
+│  │  模板执行 (template.Execute())                                      │ │
+│  │                                                                   │ │
+│  │  可能的行为：                                                      │ │
+│  │  ├── Map 键不存在 → 输出 <no value>，继续执行                    │ │
+│  │  ├── 类型断言错误 → 执行时错误（如 add 字符串和数字）           │ │
+│  │  ├── 函数执行错误 → 函数返回 error 或 panic                      │ │
+│  │  └── nil 指针引用 → panic（Listmonk 确保不会发生）              │ │
+│  └───────────────────────────────────────────────────────────────────┘ │
+│                                    │                                    │
+│                    ┌───────────────┴───────────────┐                 │
+│                    │                               │                 │
+│                    ▼                               ▼                 │
+│  ┌──────────────────────────┐    ┌──────────────────────────────┐  │
+│  │      执行成功            │    │         执行失败             │  │
+│  │  继续发送流程            │    │                              │  │
+│  │                          │    │  处理路径：                  │  │
+│  │                          │    │  ├── 活动发送时：            │  │
+│  │                          │    │  │   记录日志                │  │
+│  │                          │    │  │   continue（跳过当前订阅者）│  │
+│  │                          │    │  │   活动继续运行            │  │
+│  │                          │    │  │                          │  │
+│  │                          │    │  ├── 预览时：HTTP 400       │  │
+│  │                          │    │  │   显示详细错误           │  │
+│  │                          │    │  │                          │  │
+│  │                          │    │  └── 事务邮件时：HTTP 400   │  │
+│  │                          │    │      整个请求失败            │  │
+│  └──────────────────────────┘    └──────────────────────────────┘  │
+│                                                                         │
+└─────────────────────────────────────────────────────────────────────────┘
+```
+
+### 8.8 实际可复现的测试示例
+
+#### 测试场景1：编译期错误 - 结构体字段不存在
+
+**模板**：
+```html
+<p>{{ .Subscriber.NonExistentField }}</p>
+```
+
+**预期结果**：
+- 编译失败
+- 错误信息：`can't evaluate field NonExistentField in type models.Subscriber`
+- 活动无法启动 / 预览返回 HTTP 400
+
+**代码证据**：`models/campaigns.go:168` 的 `template.Parse()` 会检测到字段不存在。
+
+#### 测试场景2：编译期错误 - 函数不存在
+
+**模板**：
+```html
+<p>{{ NonExistentFunc }}</p>
+```
+
+**预期结果**：
+- 编译失败
+- 错误信息：`function "NonExistentFunc" not defined`
+- 活动无法启动
+
+**代码证据**：`template.Parse()` 会检查 `Funcs()` 中是否注册了该函数。
+
+#### 测试场景3：执行期行为 - Map 键不存在
+
+**模板**：
+```html
+<p>{{ .Subscriber.Attribs.unknownKey }}</p>
+```
+
+**数据上下文**：
+```go
+Subscriber{
+    Attribs: JSON{"city": "北京"},  // 没有 unknownKey
+}
+```
+
+**预期结果**：
+- 编译成功（Attribs 是结构体字段，存在）
+- 执行时输出 `<no value>`（或 `&lt;no value&gt;`）
+- 不报错，继续执行
+
+**代码证据**：Go 模板默认行为，Listmonk 没有设置 `missingkey=error`。
+
+#### 测试场景4：执行期行为 - Tx.Data 键不存在
+
+**模板**：
+```html
+<p>订单号: {{ .Tx.Data.orderNo }}</p>
+<p>不存在的键: {{ .Tx.Data.nonExistent }}</p>
+```
+
+**数据上下文**：
+```go
+TxMessage{
+    Data: map[string]any{"orderNo": "ORD-123"},  // 没有 nonExistent
+}
+```
+
+**预期结果**：
+- `{{ .Tx.Data.orderNo }}` 输出 `ORD-123`
+- `{{ .Tx.Data.nonExistent }}` 输出 `<no value>`
+- 不报错，继续执行
+
+### 8.9 变量缺失的处理建议
+
+由于 Listmonk 对 Map 缺失键的默认行为是输出 `<no value>`，建议在模板中使用以下防御性编程模式：
+
+#### 1. 使用 `default` 函数（Sprig）
+
+```go
+// 提供默认值，避免 <no value>
+{{ default "未知城市" .Subscriber.Attribs.city }}
+
+// 嵌套属性的默认值
+{{ default "N/A" .Subscriber.Attribs.profile.address }}
+
+// 事务邮件自定义数据的默认值
+{{ default "未提供" .Tx.Data.phone }}
+```
+
+#### 2. 使用条件判断
+
+```go
+{{ if .Subscriber.Attribs.vip }}
+    <p>尊敬的 VIP 用户</p>
+{{ else }}
+    <p>尊敬的用户</p>
+{{ end }}
+
+// 检查键是否存在
+{{ if .Subscriber.Attribs.city }}
+    <p>城市: {{ .Subscriber.Attribs.city }}</p>
+{{ else }}
+    <p>城市: 未提供</p>
+{{ end }}
+```
+
+#### 3. 使用 `with` 管道
+
+```go
+{{ with .Subscriber.Attribs.profile }}
+    <p>城市: {{ .city }}</p>
+    <p>电话: {{ default "未提供" .phone }}</p>
+{{ else }}
+    <p>暂无个人资料</p>
+{{ end }}
+
+// 事务邮件中
+{{ with .Tx.Data.shipping }}
+    <p>收货地址: {{ .address }}</p>
+{{ else }}
+    <p>暂无配送信息</p>
+{{ end }}
+```
+
+#### 4. 使用 `hasKey` 函数（Sprig）
+
+```go
+{{ if hasKey .Subscriber.Attribs "vip" }}
+    <p>VIP 会员</p>
+{{ end }}
+```
+
+### 8.10 错误处理的关键设计决策总结
+
+| 决策点 | 设计选择 | 代码位置 | 原因 |
+|--------|----------|----------|------|
+| 不设置 `missingkey=error` | 使用默认行为 | 所有 `template.Parse()` 调用 | 灵活性，允许模板访问可选属性 |
+| 编译错误在活动启动时检测 | 阻止活动启动 | `internal/manager/pipe.go:35` | 避免发送大量错误邮件 |
+| 渲染错误在活动发送时跳过 | 单个订阅者失败不影响全局 | `internal/manager/pipe.go:98-99` | 容错性设计 |
+| 渲染错误不计入 `MaxSendErrors` | 与发送错误区分 | 同上 | 渲染错误是模板问题，不是网络问题 |
+| 预览时返回详细错误 | 帮助用户调试模板 | `cmd/campaigns.go:179-180` | 预览场景需要快速反馈 |
+| 事务邮件返回模糊错误 | 安全性考虑 | `cmd/tx.go:134-135` | 避免暴露内部实现细节 |
+
+---
 
 ### 8.2 编译阶段错误处理
 
@@ -1691,4 +2189,58 @@ m.Body = b.Bytes()
 │  3. 构造上下文                                                      │
 │  ┌──────────────────────────────────────────────────────────────┐ │
 │  │  data = struct {                                               │ │
-│  │      Subscriber Subscriber    ←
+│  │      Subscriber Subscriber    ← 订阅者数据                     │ │
+│  │      Tx         *TxMessage    ← 事务消息（含自定义数据）       │ │
+│  │  }                                                             │ │
+│  │                                                               │ │
+│  │  两个命名空间独立，无覆盖关系                                   │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                              ↓                                     │
+│  4. 执行渲染                                                        │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │  a. 渲染主题                                                    │ │
+│  │     "您的订单 {{ .Tx.Data.orderNo }} 已确认"                  │ │
+│  │     → "您的订单 ORD-2026-005432 已确认"                       │ │
+│  │                                                               │ │
+│  │  b. 渲染主体                                                    │ │
+│  │     - {{ .Subscriber.Name }} → "张伟"                         │ │
+│  │     - {{ .Tx.Data.orderNo }} → "ORD-2026-005432"           │ │
+│  │     - {{ if eq ... "VIP" }} → 条件判断                        │ │
+│  │     - {{ range .Tx.Data.items }} → 循环渲染商品                │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                              ↓                                     │
+│  5. 最终输出                                                        │
+│  ┌──────────────────────────────────────────────────────────────┐ │
+│  │  - 主题：您的订单 ORD-2026-005432 已确认                     │ │
+│  │  - 收件人：张伟 <zhangwei@example.com>                        │ │
+│  │  - 发件人：no-reply@shop.example.com                          │ │
+│  │  - 正文：完整的 HTML 邮件（含所有变量替换）                     │ │
+│  └──────────────────────────────────────────────────────────────┘ │
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+```
+
+## 十、关键代码位置索引
+
+| 功能模块 | 文件位置 | 关键行号 |
+|----------|----------|----------|
+| 活动模型定义 | `models/campaigns.go` | 38-83 |
+| 活动模板编译 | `models/campaigns.go` | 141-242 |
+| 订阅者模型 | `models/subscribers.go` | 28-37 |
+| 事务消息模型 | `models/messages.go` | 46-71 |
+| 事务消息渲染 | `models/messages.go` | 73-133 |
+| 模板语法预处理 | `models/common.go` | 35-66 |
+| CampaignMessage 定义 | `internal/manager/manager.go` | 99-112 |
+| 模板函数定义 | `internal/manager/manager.go` | 347-403 |
+| 通用函数 + Sprig | `internal/manager/manager.go` | 632-659 |
+| 消息创建入口 | `internal/manager/message.go` | 13-29 |
+| 消息渲染实现 | `internal/manager/message.go` | 33-88 |
+| 管道处理流程 | `internal/manager/pipe.go` | 27-70, 76-134 |
+| 活动预览 API | `cmd/campaigns.go` | 137-196 |
+| 事务邮件 API | `cmd/tx.go` | 17-176 |
+| 虚拟订阅者 | `cmd/subscribers.go` | 50-55 |
+
+---
+
+**生成日期**: 2026-05-05  
+**分析版本**: Listmonk (当前代码库版本)
