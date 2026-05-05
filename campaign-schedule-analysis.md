@@ -329,7 +329,59 @@ WHERE id = $1;
 
 ## 三、调度配置机制
 
-### 3.1 活动状态模型
+### 3.1 关键约束验证
+
+#### 3.1.1 延迟发送时间必须晚于当前时间
+
+**验证位置**: `cmd/campaigns.go:694-699` 的 `validateCampaignFields` 函数
+
+```go
+// validateCampaignFields validates incoming campaign field values.
+func (a *App) validateCampaignFields(c campReq) (campReq, error) {
+    // ... 其他验证 ...
+
+    // If there's a "send_at" date, it should be in the future.
+    if c.SendAt.Valid {
+        if c.SendAt.Time.Before(time.Now()) {
+            return c, errors.New(a.i18n.T("campaigns.fieldInvalidSendAt"))
+        }
+    }
+
+    // ... 其他验证 ...
+}
+```
+
+**验证时机**:
+- 创建活动时（`CreateCampaign`）
+- 更新活动时（`UpdateCampaign`）
+
+**错误消息** (国际化):
+| 语言 | 消息 |
+|------|------|
+| 简体中文 | "预定日期应该在将来。" |
+| 英文 | "Scheduled date should be in the future." |
+
+**注意**: 这个验证只在前端提交数据时进行。如果直接操作数据库将 `send_at` 设为过去时间，`scanCampaigns` 会在下次扫描时直接触发发送。
+
+#### 3.1.2 调度状态必须设置 send_at
+
+**验证位置**: `internal/core/campaigns.go:262-268`
+
+```go
+case models.CampaignStatusScheduled:
+    // 只有 draft 或 paused 可以转为 scheduled
+    if cm.Status != models.CampaignStatusDraft && cm.Status != models.CampaignStatusPaused {
+        errMsg = c.i18n.T("campaigns.onlyDraftAsScheduled")
+    }
+    // 关键约束：调度状态必须设置 send_at
+    if !cm.SendAt.Valid {
+        errMsg = c.i18n.T("campaigns.needsSendAt")
+    }
+```
+
+**错误消息**: "广告系列需要安排一个日期。"
+
+### 3.2 活动状态模型
 
 **文件位置**: `models/campaigns.go`
 
