@@ -20,7 +20,7 @@ Listmonk 实现了两种核心的邮件追踪机制：
 - **打开追踪 (Open Tracking)**: 通过透明像素图片实现
 - **点击追踪 (Click Tracking)**: 通过中间重定向链接实现
 
-两种机制都依赖于 HTTP 请求到 listmonk 服务器，从而触发统计数据的记录。本文档详细分析从追踪请求入口、事件落库、统计聚合到管理端展示的完整闭环。
+两种机制都依赖于 HTTP 请求到 listmonk 服务器，从而触发统计数据的记录。本文档详细分析从追踪请求入口、事件落库、统计聚合到管理端展示的完整闭环，并特别关注**失败安全行为差异**、**campaign 不存在时的分支差异**、**统计接口完整范围**以及**unique 计数口径边界条件**。
 
 ---
 
@@ -131,7 +131,10 @@ func (c *Core) RegisterCampaignView(campUUID, subUUID string) error {
         if pqErr, ok := err.(*pq.Error); ok && pqErr.Column == "campaign_id" {
             return nil
         }
-        // ... 错误处理
+
+        c.log.Printf("error registering campaign view: %s", err)
+        return echo.NewHTTPError(http.StatusInternalServerError,
+            c.i18n.Ts("globals.messages.errorUpdating", "name", "{globals.terms.campaign}", "error", pqErrMsg(err)))
     }
     return nil
 }
@@ -305,8 +308,7 @@ func (a *App) LinkRedirect(c echo.Context) error {
         url, err := a.core.GetLinkURL(linkUUID)
         if err != nil {
             e := err.(*echo.HTTPError)
-            return c.Render(e.Code, tplMessage, 
-                makeMsgTpl(a.i18n.T("public.errorTitle"), "", e.Error()))
+            return c.Render(e.Code, tplMessage, makeMsgTpl(a.i18n.T("public.errorTitle"), "", e.Error()))
         }
         return c.Redirect(http.StatusTemporaryRedirect, url)
     }
@@ -321,8 +323,7 @@ func (a *App) LinkRedirect(c echo.Context) error {
     url, err := a.core.RegisterCampaignLinkClick(linkUUID, campUUID, subUUID)
     if err != nil {
         e := err.(*echo.HTTPError)
-        return c.Render(e.Code, tplMessage, 
-            makeMsgTpl(a.i18n.T("public.errorTitle"), "", e.Error()))
+        return c.Render(e.Code, tplMessage, makeMsgTpl(a.i18n.T("public.errorTitle"), "", e.Error()))
     }
 
     // 307 临时重定向（保持原始请求方法）
@@ -340,11 +341,13 @@ func (c *Core) RegisterCampaignLinkClick(linkUUID, campUUID, subUUID string) (st
     if err := c.q.RegisterLinkClick.Get(&url, linkUUID, campUUID, subUUID); err != nil {
         // 如果 link_id 不存在
         if pqErr, ok := err.(*pq.Error); ok && pqErr.Column == "link_id" {
-            return "", echo.NewHTTPError(http.StatusBadRequest, 
-                c.i18n.Ts("public.invalidLink"))
+            return "", echo.NewHTTPError(http.StatusBadRequest, c.i18n.Ts("public.invalidLink"))
         }
-        // ... 错误处理
+
+        c.log.Printf("error registering link click: %s", err)
+        return "", echo.NewHTTPError(http.StatusInternalServerError, c.i18n.Ts("public.errorProcessingRequest"))
     }
+
     return url, nil
 }
 ```
@@ -428,7 +431,7 @@ CREATE TABLE campaign_views (
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `id` | BIGSERIAL | 自增主键 |
-| `campaign_id` | INTEGER | 关联的活动 ID（级联删除） |
+| `campaign_id` | INTEGER | 关联的活动 ID（**NOT NULL**，级联删除） |
 | `subscriber_id` | INTEGER | 关联的订阅者 ID（可为 NULL，订阅者删除时置 NULL） |
 | `created_at` | TIMESTAMP | 记录创建时间 |
 
@@ -452,10 +455,12 @@ CREATE TABLE link_clicks (
 | 字段 | 类型 | 说明 |
 |------|------|------|
 | `id` | BIGSERIAL | 自增主键 |
-| `campaign_id` | INTEGER | 关联的活动 ID（可为 NULL） |
+| `campaign_id` | INTEGER | 关联的活动 ID（**可为 NULL**，级联删除） |
 | `link_id` | INTEGER | 关联的链接 ID（必填） |
 | `subscriber_id` | INTEGER | 关联的订阅者 ID（可为 NULL） |
 | `created_at` | TIMESTAMP | 记录创建时间 |
+
+> **关键差异**：`campaign_views.campaign_id` 是 `NOT NULL`，而 `link_clicks.campaign_id` 是 `NULL`。这导致 campaign 不存在时，两种追踪的行为完全不同。详见后续"事件落库分支差异"章节。
 
 ### 2. 索引设计
 
@@ -477,15 +482,15 @@ CREATE INDEX idx_clicks_date ON link_clicks(created_at);
 ### 3. 数据完整性设计
 
 ```
-campaigns (id) ─────┬──< campaign_views (campaign_id) [CASCADE]
+campaigns (id) ─────┬──< campaign_views (campaign_id) [CASCADE, NOT NULL]
                     │
-                    └──< link_clicks (campaign_id) [CASCADE]
+                    └──< link_clicks (campaign_id) [CASCADE, NULL]
 
 subscribers (id) ───┬──< campaign_views (subscriber_id) [SET NULL]
                     │
                     └──< link_clicks (subscriber_id) [SET NULL]
 
-links (id) ────────────< link_clicks (link_id) [CASCADE]
+links (id) ────────────< link_clicks (link_id) [CASCADE, NOT NULL]
 ```
 
 **关键设计点**：
@@ -636,33 +641,92 @@ Location: https://original-url.com/path
 │           │                                                                    │
 │           v                                                                    │
 │  ┌────────────────────────────────────────────────────────────────────┐     │
-│  │                        阶段 3: 事件落库                              │     │
+│  │               阶段 3: 事件落库（含失败安全与分支差异）              │     │
 │  ├────────────────────────────────────────────────────────────────────┤     │
 │  │                                                                      │     │
-│  │  像素追踪:                                                           │     │
 │  │  ┌────────────────────────────────────────────────────────────┐   │     │
-│  │  │ INSERT INTO campaign_views                                   │   │     │
-│  │  │   (campaign_id, subscriber_id)                               │   │     │
-│  │  │ VALUES                                                        │   │     │
-│  │  │   (SELECT campaigns.id WHERE uuid = $1,                     │   │     │
-│  │  │    SELECT subscribers.id WHERE uuid = $2)                   │   │     │
+│  │  │ 子阶段 3.1: campaign 不存在时的分支差异                      │   │     │
+│  │  ├────────────────────────────────────────────────────────────┤   │     │
+│  │  │                                                                 │   │     │
+│  │  │  【像素追踪 - campaign_views】                                │   │     │
+│  │  │  - campaign_id 字段: NOT NULL REFERENCES campaigns(id)       │   │     │
+│  │  │  - SQL 逻辑:                                                  │   │     │
+│  │  │    INSERT INTO campaign_views (campaign_id, ...)             │   │     │
+│  │  │    VALUES((SELECT id FROM campaigns WHERE uuid = $1), ...)   │   │     │
+│  │  │  - 如果 campaign 不存在:                                      │   │     │
+│  │  │    SELECT 返回 NULL → 插入失败（NOT NULL 约束）               │   │     │
+│  │  │  - core 层处理:                                                │   │     │
+│  │  │    if pqErr.Column == "campaign_id" { return nil }           │   │     │
+│  │  │    → 静默忽略，不返回错误                                      │   │     │
+│  │  │  - 最终效果:                                                   │   │     │
+│  │  │    不插入记录，但 handler 继续返回像素                         │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  【链接追踪 - link_clicks】                                    │   │     │
+│  │  │  - campaign_id 字段: NULL REFERENCES campaigns(id)            │   │     │
+│  │  │  - SQL 逻辑:                                                  │   │     │
+│  │  │    INSERT INTO link_clicks (campaign_id, ...) VALUES(        │   │     │
+│  │  │      (SELECT id FROM campaigns WHERE uuid = $2), ...          │   │     │
+│  │  │    )                                                           │   │     │
+│  │  │  - 如果 campaign 不存在:                                      │   │     │
+│  │  │    SELECT 返回 NULL → 插入成功（允许 NULL）                    │   │     │
+│  │  │  - core 层处理:                                                │   │     │
+│  │  │    只检查 pqErr.Column == "link_id"                          │   │     │
+│  │  │    不检查 campaign_id！                                        │   │     │
+│  │  │  - 最终效果:                                                   │   │     │
+│  │  │    插入成功，campaign_id = NULL                                │   │     │
+│  │  │    返回原始 URL，继续重定向                                    │   │     │
 │  │  └────────────────────────────────────────────────────────────┘   │     │
 │  │                                                                      │     │
-│  │  链接追踪:                                                           │     │
 │  │  ┌────────────────────────────────────────────────────────────┐   │     │
-│  │  │ INSERT INTO link_clicks                                      │   │     │
-│  │  │   (campaign_id, subscriber_id, link_id)                     │   │     │
-│  │  │ VALUES                                                        │   │     │
-│  │  │   (SELECT campaigns.id WHERE uuid = $2,                     │   │     │
-│  │  │    SELECT subscribers.id WHERE uuid = $3,                   │   │     │
-│  │  │    SELECT links.id WHERE uuid = $1)                          │   │     │
-│  │  │ RETURNING (SELECT url FROM link)                             │   │     │
+│  │  │ 子阶段 3.2: 数据库报错时的失败安全行为差异                  │   │     │
+│  │  ├────────────────────────────────────────────────────────────┤   │     │
+│  │  │                                                                 │   │     │
+│  │  │  【像素追踪 - 真正的失败安全】                                │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  Handler 层代码 (cmd/public.go:583-591):                    │   │     │
+│  │  │    if err := a.core.RegisterCampaignView(...); err != nil {  │   │     │
+│  │  │        a.log.Printf("error registering campaign view: %s", err) │   │
+│  │  │    }                                                         │   │     │
+│  │  │    // 无论如何都返回像素                                      │   │     │
+│  │  │    c.Response().Header().Set("Cache-Control", "no-cache")   │   │     │
+│  │  │    return c.Blob(http.StatusOK, "image/png", pixelPNG)       │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  行为分析:                                                     │   │     │
+│  │  │  - 数据库错误只被 log，不返回给客户端                          │   │     │
+│  │  │  - 始终返回 200 OK + PNG 二进制                               │   │     │
+│  │  │  - 客户端完全感知不到失败                                     │   │     │
+│  │  │  - 这才是真正的"失败安全"                                     │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  【链接追踪 - 非失败安全】                                    │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  Handler 层代码 (cmd/public.go:556-562):                    │   │     │
+│  │  │    url, err := a.core.RegisterCampaignLinkClick(...)          │   │     │
+│  │  │    if err != nil {                                            │   │     │
+│  │  │        e := err.(*echo.HTTPError)                             │   │     │
+│  │  │        return c.Render(e.Code, tplMessage, ...)              │   │     │
+│  │  │    }                                                         │   │     │
+│  │  │    return c.Redirect(http.StatusTemporaryRedirect, url)       │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  行为分析:                                                     │   │     │
+│  │  │  - 数据库错误直接返回给客户端                                  │   │     │
+│  │  │  - 渲染错误页面，而非继续重定向                                │   │     │
+│  │  │  - 用户会看到错误提示                                          │   │     │
+│  │  │  - 这**不是**失败安全！                                       │   │     │
+│  │  │                                                                 │   │     │
+│  │  │  唯一例外：link_id 不存在时                                   │   │     │
+│  │  │    core 层返回 400 "invalid link"                            │   │     │
+│  │  │    这是预期行为，而非系统错误                                  │   │     │
 │  │  └────────────────────────────────────────────────────────────┘   │     │
 │  │                                                                      │     │
-│  │  外键异常处理:                                                       │     │
-│  │    └──> campaign_id 不存在 → 静默忽略 (返回 nil)                   │     │
-│  │    └──> link_id 不存在 → 返回错误 "invalid link"                   │     │
-│  │    └──> subscriber_id 不存在 → subscriber_id = NULL               │     │
+│  │  外键异常处理总览:                                                   │     │
+│  │    ┌──────────────────────────────────────────────────────────┐   │     │
+│  │    │ 异常类型          │ 像素追踪          │ 链接追踪          │   │     │
+│  │    ├──────────────────────────────────────────────────────────┤   │     │
+│  │    │ campaign_id 不存在 │ 静默忽略(200)    │ 插入成功(NULL)   │   │     │
+│  │    │ link_id 不存在     │ 不适用            │ 400 invalid link │   │     │
+│  │    │ subscriber_id 不存在 │ 插入成功(NULL)  │ 插入成功(NULL)   │   │     │
+│  │    │ 其他数据库错误     │ 静默忽略(200)    │ 返回错误页面     │   │     │
+│  │    └──────────────────────────────────────────────────────────┘   │     │
 │  └────────────────────────────────────────────────────────────────────┘     │
 │           │                                                                    │
 │           v                                                                    │
@@ -671,17 +735,25 @@ Location: https://original-url.com/path
 │  ├────────────────────────────────────────────────────────────────────┤     │
 │  │                                                                      │     │
 │  │  像素追踪:                                                           │     │
-│  │    └──> Content-Type: image/png                                     │     │
-│  │    └──> Cache-Control: no-cache                                     │     │
-│  │    └──> 14x3 透明 PNG 二进制数据                                   │     │
+│  │    ┌────────────────────────────────────────────────────────────┐   │     │
+│  │    │ 成功或失败:                                                  │   │     │
+│  │    │   Content-Type: image/png                                    │   │     │
+│  │    │   Cache-Control: no-cache                                    │   │     │
+│  │    │   Status: 200 OK                                             │   │     │
+│  │    │   Body: 14x3 透明 PNG 二进制数据                              │   │     │
+│  │    └────────────────────────────────────────────────────────────┘   │     │
 │  │                                                                      │     │
 │  │  链接追踪:                                                           │     │
-│  │    └──> Status: 307 Temporary Redirect                             │     │
-│  │    └──> Location: {原始 URL}                                        │     │
-│  │                                                                      │     │
-│  │  失败安全设计 (Fail-Safe):                                          │     │
-│  │    └──> 即使数据库插入失败，仍然返回响应                            │     │
-│  │    └──> 不影响用户体验                                              │     │
+│  │    ┌────────────────────────────────────────────────────────────┐   │     │
+│  │    │ 成功路径:                                                    │   │     │
+│  │    │   Status: 307 Temporary Redirect                            │   │     │
+│  │    │   Location: {原始 URL}                                      │   │     │
+│  │    │                                                              │   │     │
+│  │    │ 失败路径:                                                    │   │     │
+│  │    │   Status: 400 / 500                                         │   │     │
+│  │    │   Content-Type: text/html                                    │   │     │
+│  │    │   Body: 错误页面渲染                                         │   │     │
+│  │    └────────────────────────────────────────────────────────────┘   │     │
 │  └────────────────────────────────────────────────────────────────────┘     │
 │           │                                                                    │
 │           v                                                                    │
@@ -704,11 +776,13 @@ Location: https://original-url.com/path
 │  │    └──> GET /api/campaigns/analytics/:type                        │     │
 │  │    └──> 需要权限: campaigns:get_analytics                          │     │
 │  │                                                                      │     │
-│  │  统计类型:                                                           │     │
+│  │  统计类型 (type 参数完整范围):                                       │     │
 │  │    ┌──────────────┬────────────────────────────────────────────┐  │     │
 │  │    │ type = views │ 按小时/天聚合的打开时间序列                  │  │     │
 │  │    ├──────────────┼────────────────────────────────────────────┤  │     │
 │  │    │ type = clicks│ 按小时/天聚合的点击时间序列                  │  │     │
+│  │    ├──────────────┼────────────────────────────────────────────┤  │     │
+│  │    │ type = bounces│ 按小时/天聚合的退信时间序列                 │  │     │
 │  │    ├──────────────┼────────────────────────────────────────────┤  │     │
 │  │    │ type = links │ 各链接的点击次数排行榜 (TOP 50)             │  │     │
 │  │    └──────────────┴────────────────────────────────────────────┘  │     │
@@ -716,20 +790,51 @@ Location: https://original-url.com/path
 │  │  时间粒度自动选择:                                                   │     │
 │  │    └──> 时间间隔 < 7 天: 按小时聚合                                │     │
 │  │    └──> 时间间隔 >= 7 天: 按天聚合                                 │     │
+│  │                                                                      │     │
+│  │  Unique 计数口径边界说明:                                           │     │
+│  │    ┌──────────────────────────────────────────────────────────┐   │     │
+│  │    │ PostgreSQL DISTINCT ON(subscriber_id) 行为:               │   │     │
+│  │    │                                                              │   │     │
+│  │    │  真实订阅者 (subscriber_id != NULL):                        │   │     │
+│  │    │    └──> 同一订阅者的多条记录只保留第一行                    │   │     │
+│  │    │    └──> 每个订阅者只计一次                                   │   │     │
+│  │    │                                                              │   │     │
+│  │    │  匿名事件 (subscriber_id = NULL):                           │   │     │
+│  │    │    └──> PostgreSQL 中 NULL != NULL                          │   │     │
+│  │    │    └──> 每个 NULL 值都被视为不同                            │   │     │
+│  │    │    └──> 每条匿名记录都计一次                                 │   │     │
+│  │    │                                                              │   │     │
+│  │    │  边界情况:                                                    │   │     │
+│  │    │    └──> 匿名追踪模式下，unique 计数 = 普通计数              │   │     │
+│  │    │    └──> 因为所有记录的 subscriber_id 都是 NULL             │   │     │
+│  │    │    └──> 每条记录都独立计数                                   │   │     │
+│  │    └──────────────────────────────────────────────────────────┘   │     │
 │  └────────────────────────────────────────────────────────────────────┘     │
 │                                                                              │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
-#### 3.2 隐私分支的详细对比
+#### 3.2 失败安全行为对比表
 
-| 配置组合 | DisableTracking | IndividualTracking | 模板渲染 | 请求处理 | 数据库记录 |
-|---------|-----------------|--------------------|----------|----------|------------|
-| **全局禁用** | `true` | - | 不嵌入像素/不重写链接 | 返回响应但跳过记录 | 无记录 |
-| **匿名追踪** | `false` | `false` | 嵌入像素/重写链接，但 subUUID = dummyUUID | subUUID 置空字符串 | 记录事件，subscriber_id = NULL |
-| **个体追踪** | `false` | `true` | 嵌入像素/重写链接，使用真实 subUUID | 保留原始 subUUID | 记录事件，subscriber_id = 实际 ID |
+| 维度 | 像素追踪 (RegisterCampaignView) | 链接追踪 (LinkRedirect) |
+|------|---------------------------------|-------------------------|
+| **Handler 层错误处理** | 只 log，不返回 | 直接返回错误页面 |
+| **数据库错误时的响应** | 始终返回 200 + PNG | 返回 400/500 错误页面 |
+| **用户感知** | 完全无感知 | 会看到错误提示 |
+| **是否失败安全** | **是** | **否** |
+| **代码位置** | `cmd/public.go:583-591` | `cmd/public.go:556-562` |
 
-#### 3.3 CORS 与追踪请求的关系
+#### 3.3 Campaign 不存在时的分支差异
+
+| 维度 | 像素追踪 (campaign_views) | 链接追踪 (link_clicks) |
+|------|---------------------------|------------------------|
+| **campaign_id 约束** | `NOT NULL REFERENCES` | `NULL REFERENCES` |
+| **campaign 不存在时** | SELECT 返回 NULL → 插入失败 | SELECT 返回 NULL → 插入成功 |
+| **core 层处理** | 检查 `pqErr.Column == "campaign_id"`，返回 nil | 只检查 `link_id`，不检查 `campaign_id` |
+| **最终效果** | 不插入记录，返回像素 | 插入成功，`campaign_id = NULL`，继续重定向 |
+| **统计影响** | 无记录，不影响统计 | 有记录，但 campaign_id 为 NULL，无法关联到具体活动 |
+
+#### 3.4 CORS 与追踪请求的关系
 
 **重要结论**：邮件追踪本身**不需要**配置 CORS。
 
@@ -769,7 +874,9 @@ Listmonk 提供三层隐私控制：
 if a.cfg.Privacy.DisableTracking {
     url, err := a.core.GetLinkURL(linkUUID)
     if err != nil {
-        // ... 错误处理
+        e := err.(*echo.HTTPError)
+        return c.Render(e.Code, tplMessage, 
+            makeMsgTpl(a.i18n.T("public.errorTitle"), "", e.Error()))
     }
     return c.Redirect(http.StatusTemporaryRedirect, url)
 }
@@ -926,14 +1033,63 @@ WHERE campaign_id=ANY($1) AND created_at >= $2 AND created_at <= $3
 GROUP BY campaign_id, "timestamp" ORDER BY "timestamp" ASC;
 ```
 
-### 3. 去重统计 (Unique Counts)
+### 3. 统计接口 type 的完整范围
 
-当 `privacy.individual_tracking = true` 时，使用去重统计：
+**位置**: `internal/core/campaigns.go:384-409`
+
+```go
+func (c *Core) GetCampaignAnalyticsCounts(campIDs []int, typ, fromDate, toDate string) ([]models.CampaignAnalyticsCount, error) {
+    var stmt *sqlx.Stmt
+    switch typ {
+    case "views":
+        stmt = c.q.GetCampaignViewCounts
+    case "clicks":
+        stmt = c.q.GetCampaignClickCounts
+    case "bounces":  // 新增：退信统计
+        stmt = c.q.GetCampaignBounceCounts
+    default:
+        // ...
+    }
+    // ...
+}
+```
+
+**完整的 type 参数范围**：
+
+| type 值 | 统计类型 | 数据源 | 时间聚合 |
+|---------|----------|--------|----------|
+| `views` | 打开统计 | `campaign_views` | 按小时/天聚合 |
+| `clicks` | 点击统计 | `link_clicks` | 按小时/天聚合 |
+| `bounces` | 退信统计 | `bounces` | 按小时/天聚合 |
+| `links` | 链接排行榜 | `link_clicks` + `links` | TOP 50，按 URL 分组 |
+
+**退信统计 SQL**：
+
+**位置**: `queries/campaigns.sql:259-267`
+
+```sql
+-- name: get-campaign-bounce-counts
+WITH intval AS (
+    SELECT CASE WHEN (EXTRACT (EPOCH FROM ($3::TIMESTAMP - $2::TIMESTAMP)) / 86400) >= 7 THEN 'day' ELSE 'hour' END
+)
+SELECT campaign_id, COUNT(*) AS "count", DATE_TRUNC((SELECT * FROM intval), created_at) AS "timestamp"
+    FROM bounces
+    WHERE campaign_id=ANY($1) AND created_at >= $2 AND created_at <= $3
+    GROUP BY campaign_id, "timestamp" ORDER BY "timestamp" ASC;
+```
+
+### 4. Unique 计数口径与边界说明
+
+#### 4.1 Unique 计数查询
 
 **位置**: `queries/campaigns.sql:234-246`
 
 ```sql
-WITH uniqIDs AS (
+-- name: get-campaign-analytics-unique-counts
+WITH intval AS (
+    SELECT CASE WHEN (EXTRACT (EPOCH FROM ($3::TIMESTAMP - $2::TIMESTAMP)) / 86400) >= 7 THEN 'day' ELSE 'hour' END
+),
+uniqIDs AS (
     SELECT DISTINCT ON(subscriber_id) subscriber_id, campaign_id, 
            DATE_TRUNC((SELECT * FROM intval), created_at) AS "timestamp"
     FROM %s
@@ -944,19 +1100,39 @@ SELECT COUNT(*) AS "count", campaign_id, "timestamp"
 FROM uniqIDs GROUP BY campaign_id, "timestamp" ORDER BY "timestamp" ASC;
 ```
 
-### 4. 链接点击排行榜
+#### 4.2 PostgreSQL DISTINCT ON 行为分析
 
-**位置**: `queries/campaigns.sql:269-276`
+**关键知识点**：PostgreSQL 中 `NULL != NULL`，即两个 NULL 值不相等。
 
-```sql
-SELECT COUNT(%s) AS "count", url
-FROM link_clicks
-LEFT JOIN links ON (link_clicks.link_id = links.id)
-WHERE campaign_id=ANY($1) AND link_clicks.created_at >= $2 AND link_clicks.created_at <= $3
-GROUP BY links.url ORDER BY "count" DESC LIMIT 50;
-```
+**场景对比**：
 
-### 5. 启动时的查询准备
+| 场景 | subscriber_id 值 | DISTINCT ON 行为 | 计数结果 |
+|------|------------------|------------------|----------|
+| 真实订阅者 A | 100, 100, 100 | 只保留第一行 | 计 1 次 |
+| 真实订阅者 B | 200, 200 | 只保留第一行 | 计 1 次 |
+| 匿名事件 | NULL, NULL, NULL | 每个 NULL 视为不同 | 计 3 次 |
+
+#### 4.3 边界情况详解
+
+**边界情况 1：匿名追踪模式 (IndividualTracking = false)**
+
+- 所有记录的 `subscriber_id` 都是 NULL
+- `DISTINCT ON(subscriber_id)` 对 NULL 无效
+- **结果**：unique 计数 = 普通计数
+
+**边界情况 2：混合模式（部分订阅者已删除）**
+
+- 真实订阅者：每个只计一次
+- 已删除订阅者（subscriber_id = NULL）：每条都计一次
+- **结果**：真实订阅者去重，匿名事件累加
+
+**边界情况 3：同一订阅者多次打开**
+
+- `subscriber_id = 100` 的多条记录
+- `DISTINCT ON(subscriber_id)` 只保留第一行
+- **结果**：每个订阅者每天/每小时只计一次
+
+#### 4.4 Unique 计数的启动时准备
 
 **位置**: `cmd/init.go:400-429`
 
@@ -985,6 +1161,30 @@ func prepareQueries(qMap goyesql.Queries, db *sqlx.DB, ko *koanf.Koanf) *models.
 }
 ```
 
+**关键设计**：
+- Unique/普通计数是**启动时决定**的，不是运行时
+- `privacy.individual_tracking` 配置决定使用哪种查询
+- 匿名追踪模式下，unique 计数查询实际效果 = 普通计数
+
+### 5. 链接点击排行榜
+
+**位置**: `queries/campaigns.sql:269-276`
+
+```sql
+-- name: get-campaign-link-counts
+-- raw: true
+-- %s = * or DISTINCT subscriber_id (prepared based on based on individual tracking=on/off). Prepared on boot.
+SELECT COUNT(%s) AS "count", url
+FROM link_clicks
+LEFT JOIN links ON (link_clicks.link_id = links.id)
+WHERE campaign_id=ANY($1) AND link_clicks.created_at >= $2 AND link_clicks.created_at <= $3
+GROUP BY links.url ORDER BY "count" DESC LIMIT 50;
+```
+
+**排行榜的 unique 计数**：
+- `IndividualTracking = true`: `COUNT(DISTINCT subscriber_id)`
+- `IndividualTracking = false`: `COUNT(*)`
+
 ### 6. 管理端 API 处理
 
 **位置**: `cmd/campaigns.go:603-642`
@@ -995,12 +1195,12 @@ func (a *App) GetCampaignViewAnalytics(c echo.Context) error {
     // ... 参数验证
 
     var (
-        typ  = c.Param("type")  // views | clicks | links
+        typ  = c.Param("type")  // views | clicks | bounces | links
         from = c.QueryParams().Get("from")
         to   = c.QueryParams().Get("to")
     )
 
-    // 链接统计
+    // 链接统计（排行榜）
     if typ == "links" {
         out, err := a.core.GetCampaignAnalyticsLinks(ids, typ, from, to)
         if err != nil {
@@ -1009,7 +1209,7 @@ func (a *App) GetCampaignViewAnalytics(c echo.Context) error {
         return c.JSON(http.StatusOK, okResp{out})
     }
 
-    // 视图/点击统计（时间序列）
+    // 视图/点击/退信统计（时间序列）
     out, err := a.core.GetCampaignAnalyticsCounts(ids, typ, from, to)
     if err != nil {
         return err
@@ -1099,6 +1299,7 @@ g.GET("/api/campaigns/analytics/:type", pm(a.GetCampaignViewAnalytics, "campaign
 │  │    │ RegisterCampaignView()          │                         │   │
 │  │    │ - 没有 hasSub！                 │                         │   │
 │  │    │ - 不验证订阅者是否存在          │                         │   │
+│  │    │ - 真正的失败安全（始终返回PNG） │                         │   │
 │  │    └─────────────────────────────────┘                         │   │
 │  │                                                                  │   │
 │  │  链接追踪端点:                                                   │   │
@@ -1115,6 +1316,7 @@ g.GET("/api/campaigns/analytics/:type", pm(a.GetCampaignViewAnalytics, "campaign
 │  │    │ LinkRedirect()                  │                         │   │
 │  │    │ - 没有 hasSub！                 │                         │   │
 │  │    │ - 不验证订阅者是否存在          │                         │   │
+│  │    │ - 非失败安全（出错返回错误页）  │                         │   │
 │  │    └─────────────────────────────────┘                         │   │
 │  │                                                                  │   │
 │  │  注意: hasSub 只用于订阅相关页面，如:                           │   │
@@ -1125,12 +1327,10 @@ g.GET("/api/campaigns/analytics/:type", pm(a.GetCampaignViewAnalytics, "campaign
 │                         v                    v                        │
 │  ┌──────────────────────────┐    ┌──────────────────────────────┐   │
 │  │ RegisterCampaignView()   │    │ LinkRedirect()               │   │
-│  │ - 检查追踪配置            │    │ - 检查追踪配置                │   │
-│  │ - 检查个体追踪            │    │ - 检查个体追踪                │   │
-│  │ - 排除 dummy UUID        │    │ - 记录点击到 link_clicks      │   │
-│  │ - 插入 campaign_views    │    │ - 307 重定向到原始 URL       │   │
-│  │ - 返回 14x3 透明 PNG     │    └──────────────────────────────┘   │
-│  └──────────────────────────┘                                         │
+│  │ - 真正的失败安全          │    │ - 非失败安全                  │   │
+│  │ - 始终返回 200 + PNG      │    │ - 出错返回错误页面            │   │
+│  │ - campaign 不存在时静默忽略│    │ - campaign 不存在时插入成功   │   │
+│  └──────────────────────────┘    └──────────────────────────────┘   │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -1152,91 +1352,11 @@ g.GET("/api/campaigns/analytics/:type", pm(a.GetCampaignViewAnalytics, "campaign
 │  │campaign_views│      │ link_clicks  │               │              │
 │  │ (打开记录表)  │      │ (点击记录表)  │               │              │
 │  ├──────────────┤      ├──────────────┤               │              │
-│  │ campaign_id  │      │ campaign_id  │◄──────────────┘              │
+│  │ campaign_id  │ NOT  │ campaign_id  │ NULL ◄────────┘              │
 │  │ subscriber_id│◄─────│ subscriber_id│                              │
 │  │ created_at   │      │ link_id      │◄───────────────────────────┐ │
 │  └──────────────┘      │ created_at   │                            │ │
 │                         └──────────────┘                            │ │
 │                                                                       │ │
-│  外键约束:                                                            │ │
-│  - campaign_id:   ON DELETE CASCADE  (活动删除时级联删除记录)        │ │
-│  - subscriber_id: ON DELETE SET NULL (订阅者删除时置空，保留统计)    │ │
-│  - link_id:       ON DELETE CASCADE  (链接删除时级联删除点击记录)    │ │
-│                                                                       │ │
-└──────────────────────────────────────────────────────────────────────┘
-```
-
-### 3. URL 格式汇总
-
-| 类型 | URL 格式 | 处理函数 | 中间件 |
-|------|----------|----------|--------|
-| 打开追踪像素 | `{root}/campaign/{campUUID}/{subUUID}/px.png` | `RegisterCampaignView` | `noIndex` → `hasUUID` |
-| 链接追踪重定向 | `{root}/link/{linkUUID}/{campUUID}/{subUUID}` | `LinkRedirect` | `noIndex` → `hasUUID` |
-| 邮件在线查看 | `{root}/campaign/{campUUID}/{subUUID}` | `ViewCampaignMessage` | `noIndex` → `hasUUID` |
-| 订阅管理页面 | `{root}/subscription/:campUUID/:subUUID` | `SubscriptionPage` | `noIndex` → `hasUUID` → `hasSub` |
-| 统计分析 API | `{root}/api/campaigns/analytics/:type` | `GetCampaignViewAnalytics` | `pm (权限校验)` |
-
----
-
-## 关键文件位置汇总
-
-| 功能 | 文件路径 |
-|------|----------|
-| HTTP 处理器 | `cmd/public.go` |
-| 路由注册与中间件 | `cmd/handlers.go` |
-| 追踪模板函数 | `internal/manager/manager.go` |
-| 核心业务逻辑 | `internal/core/campaigns.go` |
-| 数据库 Schema | `schema.sql` |
-| SQL 查询 | `queries/campaigns.sql`, `queries/links.sql` |
-| URL 配置 | `cmd/init.go` |
-| 管理端 API | `cmd/campaigns.go` |
-
----
-
-## 总结
-
-### 1. 修正的事实错误
-
-#### 1.1 像素尺寸
-
-| 错误描述 | 正确事实 |
-|---------|---------|
-| "3x14 像素"（含糊） | **14x3 像素（宽 x 高）** |
-| - | `drawTransparentImage(3, 14)` → h=3, w=14 |
-| - | `image.Rect(0, 0, 14, 3)` → 宽 14, 高 3 |
-
-#### 1.2 中间件链路
-
-| 错误描述 | 正确事实 |
-|---------|---------|
-| 追踪端点有 `hasSub` 中间件 | **追踪端点 NO `hasSub`** |
-| - | 像素追踪: `noIndex` → `hasUUID` → `RegisterCampaignView` |
-| - | 链接追踪: `noIndex` → `hasUUID` → `LinkRedirect` |
-| - | `hasSub` 只用于 `/subscription/...` 等订阅页面 |
-
-### 2. 设计亮点
-
-1. **失败安全 (Fail-Safe)**: 即使记录失败，也会返回像素图片或执行重定向，不影响用户体验
-2. **多层隐私控制**: 从全局禁用到匿名追踪再到个体追踪，灵活满足不同隐私需求
-3. **数据完整性**: 订阅者删除时保留匿名化统计数据（SET NULL），活动删除时清理相关记录（CASCADE）
-4. **缓存优化**: 链接注册使用内存缓存，避免重复数据库查询
-5. **智能统计**: 根据时间间隔自动选择聚合粒度（小时/天），根据追踪模式选择计数方式（去重/普通）
-
-### 3. 隐私设计要点
-
-1. **Dummy UUID**: 模板预览时使用 `00000000-0000-0000-0000-000000000000`，避免污染统计数据
-2. **SET NULL 策略**: 订阅者删除后，记录中的 `subscriber_id` 置 NULL，保留历史统计但无法关联到具体个人
-3. **可选个体追踪**: 管理员可选择是否记录具体订阅者的行为
-4. **无 `hasSub` 中间件**: 追踪端点不验证订阅者存在，即使订阅者已删除，事件仍可匿名记录
-
-### 4. 技术要点
-
-1. **307 重定向**: 保持原始 HTTP 方法，虽然链接点击通常是 GET
-2. **透明 PNG**: 14x3 像素（宽x高），Go 标准库动态生成，无需外部文件
-3. **Cache-Control: no-cache**: 防止浏览器缓存像素请求，确保每次打开都被记录
-4. **X-Robots-Tag: noindex**: 防止搜索引擎索引追踪端点
-5. **动态查询准备**: 启动时根据 `individual_tracking` 配置选择去重/普通计数查询
-
----
-
-*分析基于 listmonk 代码库，修订时间: 2026-05-05*
+│  关键差异:                                                            │ │
+│  -
