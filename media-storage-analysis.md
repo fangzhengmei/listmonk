@@ -706,6 +706,614 @@ func (c *Client) GetBlob(uurl string) ([]byte, error) {
 
 ---
 
+### 5.8 完整证据链分层分析（三次核查增补）
+
+为了彻底验证失败点，我们将整个请求流程分为**三层**进行分析：
+
+#### 第一层：路由层 - 是否命中？命中后参数值是什么？
+
+**代码证据**（`cmd/init.go:954-964`）：
+
+```go
+case uploadProvider == "s3" && strings.HasPrefix(publicURL, "/"):
+    // 路由注册：使用 Echo 的 :filepath 参数
+    srv.GET(path.Join(publicURL, "/:filepath"), app.ServeS3Media)
+```
+
+**Echo 框架路由参数行为**：
+
+根据 Echo 官方文档和源码分析：
+
+| 参数类型 | 语法 | 匹配行为 |
+|---------|------|----------|
+| 单段参数 | `:param` | 匹配单段路径（不跨斜杠） |
+| 通配符参数 | `*` | 匹配所有剩余路径（跨斜杠） |
+
+**关键结论**：
+- `:filepath` 是**单段参数**，只匹配到**第一个斜杠之前**的内容
+- 如果 URL 是 `/s3-media/assets/image.jpg`，则 `:filepath` 只匹配到 `"assets"`
+- `image.jpg` 部分**不会被匹配**，路由实际会返回 404（因为额外的路径段没有对应的路由）
+
+**路由匹配验证表**：
+
+| 注册路由 | 请求 URL | 是否命中 | `c.Param("filepath")` 值 |
+|---------|----------|----------|-------------------------|
+| `/s3-media/:filepath` | `/s3-media/image.jpg` | ✅ 是 | `"image.jpg"` |
+| `/s3-media/:filepath` | `/s3-media/assets/image.jpg` | ❌ **否（404）** | 不适用 |
+| `/s3-media/:filepath` | `/s3-media/assets/images/photo.jpg` | ❌ **否（404）** | 不适用 |
+
+**重要修正**：之前的分析有误。实际上，当请求 URL 是 `/s3-media/assets/image.jpg` 时：
+- Echo 路由 `/s3-media/:filepath` **不会命中**（因为 URL 有额外的路径段）
+- 客户端会收到 **404 Not Found** 响应
+- `ServeS3Media` 处理器根本不会被调用
+
+这比之前分析的"参数不完整"更严重：**请求根本无法到达处理器**。
+
+#### 第二层：处理器层 - 参数如何传入？
+
+**代码证据**（`cmd/media.go:195-208`）：
+
+```go
+func (a *App) ServeS3Media(c echo.Context) error {
+    // 直接从路由参数获取
+    key := c.Param("filepath")
+    
+    // 如果 key 为空，返回 400
+    if key == "" {
+        return echo.NewHTTPError(http.StatusBadRequest, "missing media file path")
+    }
+
+    // 直接传递给 GetBlob
+    b, err := a.media.GetBlob(key)
+    // ...
+}
+```
+
+**参数传递链**：
+
+```
+客户端请求 URL → Echo 路由匹配 → c.Param("filepath") → key → GetBlob(key)
+```
+
+**如果路由能够命中的情况**（假设使用通配符路由）：
+
+| 注册路由 | 请求 URL | `c.Param("filepath")` 值 | 传入 GetBlob 的值 |
+|---------|----------|-------------------------|-------------------|
+| `/s3-media/*` | `/s3-media/image.jpg` | `"image.jpg"` | `"image.jpg"` |
+| `/s3-media/*` | `/s3-media/assets/image.jpg` | `"assets/image.jpg"` | `"assets/image.jpg"` |
+| `/s3-media/*` | `/s3-media/assets/images/photo.jpg` | `"assets/images/photo.jpg"` | `"assets/images/photo.jpg"` |
+
+#### 第三层：GetBlob 层 - 路径归一化对对象键的实际影响
+
+**代码证据**（`internal/media/providers/s3/s3.go:111-136`）：
+
+```go
+func (c *Client) GetBlob(uurl string) ([]byte, error) {
+    // 第一处 filepath.Base
+    if p, err := url.Parse(uurl); err != nil {
+        // 不是有效 URL，走这个分支
+        uurl = filepath.Base(uurl)
+    } else {
+        // 是有效 URL，从路径中取文件名
+        uurl = filepath.Base(p.Path)
+    }
+
+    // 从 S3 下载
+    file, err := c.s3.FileDownload(simples3.DownloadInput{
+        Bucket:    c.opts.Bucket,
+        // 第二处 filepath.Base
+        ObjectKey: c.makeBucketPath(filepath.Base(uurl)),
+    })
+    // ...
+}
+```
+
+**filepath.Base 行为验证**：
+
+| 输入值 | `url.Parse` 结果 | 第一处处理后 | 第二处 `filepath.Base` | 最终 `ObjectKey`（假设 `bucket_path="assets"`） |
+|--------|-----------------|--------------|----------------------|------------------------------------------------|
+| `"image.jpg"` | 解析失败（不是 URL） | `"image.jpg"` | `"image.jpg"` | `"assets/image.jpg"` ✅ |
+| `"assets/image.jpg"` | 解析失败 | `"image.jpg"` | `"image.jpg"` | `"assets/image.jpg"` ⚠️ |
+| `"assets/images/photo.jpg"` | 解析失败 | `"photo.jpg"` | `"photo.jpg"` | `"assets/photo.jpg"` ❌ |
+| `"https://cdn.example.com/assets/image.jpg"` | 解析成功 | `"image.jpg"` | `"image.jpg"` | `"assets/image.jpg"` ⚠️ |
+
+**makeBucketPath 行为验证**（`internal/media/providers/s3/s3.go:150-159`）：
+
+```go
+func (c *Client) makeBucketPath(name string) string {
+    // 清理 bucket_path 的前后斜杠
+    p := strings.TrimPrefix(strings.TrimSuffix(c.opts.BucketPath, "/"), "/")
+    if p == "" {
+        return name
+    }
+    // 拼接：bucket_path + "/" + name
+    return p + "/" + name
+}
+```
+
+| `bucket_path` 配置 | `name` 输入 | `makeBucketPath` 输出 |
+|-------------------|-------------|----------------------|
+| `""` | `"image.jpg"` | `"image.jpg"` |
+| `"assets"` | `"image.jpg"` | `"assets/image.jpg"` |
+| `"assets/images"` | `"photo.jpg"` | `"assets/images/photo.jpg"` |
+
+#### 三层证据链总结
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                    S3 相对路径代理三层证据链总结                               │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  【第一层：路由层】                                                           │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  路由注册：`srv.GET("/s3-media/:filepath", ServeS3Media)`          │   │
+│  │                                                                     │   │
+│  │  问题：`:filepath` 是单段参数，不跨斜杠匹配                        │   │
+│  │                                                                     │   │
+│  │  请求 URL：`/s3-media/assets/image.jpg`                            │   │
+│  │  路由行为：❌ 不命中（404）                                        │   │
+│  │  原因：`:filepath` 只能匹配单段，`/assets/image.jpg` 有两段        │   │
+│  │                                                                     │   │
+│  │  ⚠️ 关键发现：请求根本无法到达处理器！                              │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                     ↓                                        │
+│  【第二层：处理器层】（只有路由命中才会执行）                                 │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  参数获取：`key := c.Param("filepath")`                            │   │
+│  │  参数传递：`a.media.GetBlob(key)`                                  │   │
+│  │                                                                     │   │
+│  │  即使路由修复为通配符：                                             │   │
+│  │  - 请求 `/s3-media/assets/image.jpg`                               │   │
+│  │  - `key = "assets/image.jpg"`                                      │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                     ↓                                        │
+│  【第三层：GetBlob 层】                                                       │
+│  ┌─────────────────────────────────────────────────────────────────────┐   │
+│  │  输入：`uurl = "assets/image.jpg"`（假设路由已修复）                │   │
+│  │                                                                     │   │
+│  │  第一处 filepath.Base：                                             │   │
+│  │  - `url.Parse("assets/image.jpg")` 失败（不是有效 URL）           │   │
+│  │  - `uurl = filepath.Base("assets/image.jpg") = "image.jpg"`       │   │
+│  │  - ⚠️ 目录层级 `assets/` 被丢弃！                                   │   │
+│  │                                                                     │   │
+│  │  第二处 filepath.Base（构造 ObjectKey）：                          │   │
+│  │  - `filepath.Base("image.jpg") = "image.jpg"`                     │   │
+│  │  - `makeBucketPath("image.jpg")`（假设 bucket_path="assets"）    │   │
+│  │  - 最终 ObjectKey = "assets/image.jpg"                             │   │
+│  │                                                                     │   │
+│  │  巧合场景：这个例子恰好正确，但深层问题仍然存在                     │   │
+│  └─────────────────────────────────────────────────────────────────────┘   │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+### 5.9 可复现的最小请求路径示例
+
+为了确保问题可复现，我们提供以下完整的测试场景：
+
+#### 测试配置
+
+```toml
+[app]
+root_url = "https://listmonk.example.com"
+
+[upload]
+provider = "s3"
+
+[upload.s3]
+aws_default_region = "ap-south-1"
+aws_access_key_id = "AKIA..."
+aws_secret_access_key = "..."
+bucket = "listmonk-media"
+bucket_path = "assets/images"      # ⚠️ 非空路径
+bucket_type = "public"
+url = "https://s3.ap-south-1.amazonaws.com"
+public_url = "/s3-media"            # 相对路径
+```
+
+#### 测试步骤
+
+**步骤 1：上传测试文件**
+
+1. 访问 listmonk 后台 → 媒体库
+2. 上传文件 `photo.jpg`
+3. 观察上传结果：
+   - 数据库 `media.filename` = `"photo.jpg"`
+   - 实际 S3 对象键：`assets/images/photo.jpg`（由 `makeBucketPath("photo.jpg")` 生成）
+
+**步骤 2：获取访问 URL**
+
+通过 API 获取媒体信息：
+```
+GET /api/media
+```
+
+响应中的 URL：
+```json
+{
+  "url": "https://listmonk.example.com/s3-media/assets/images/photo.jpg"
+}
+```
+
+**URL 生成逻辑验证**：
+1. `makeFileURL("photo.jpg")` 被调用
+2. `public_url = "/s3-media"` 是相对路径
+3. 拼接为：`RootURL + public_url + "/" + makeBucketPath("photo.jpg")`
+4. 结果：`"https://listmonk.example.com" + "/s3-media" + "/" + "assets/images/photo.jpg"`
+5. 最终 URL：`"https://listmonk.example.com/s3-media/assets/images/photo.jpg"`
+
+**步骤 3：访问 URL（测试失败点）**
+
+**场景 A：直接访问生成的 URL**
+
+```
+请求：GET https://listmonk.example.com/s3-media/assets/images/photo.jpg
+```
+
+**路由匹配分析**：
+- 注册路由：`/s3-media/:filepath`
+- 请求 URL 路径：`/s3-media/assets/images/photo.jpg`
+- `:filepath` 是单段参数，只能匹配**第一个斜杠前**的内容
+- `/s3-media/` 后的路径有三段：`assets/images/photo.jpg`
+- **路由不匹配**，返回 **404 Not Found**
+
+**实际 HTTP 响应**：
+```
+HTTP/1.1 404 Not Found
+Content-Type: text/plain; charset=UTF-8
+
+Not Found
+```
+
+**服务器日志**：
+```
+# 没有 "ServeS3Media" 相关日志（因为路由没命中）
+# 只有 404 请求日志
+```
+
+**场景 B：测试通配符路由修复后的行为（假设）**
+
+如果路由被修复为：
+```go
+srv.GET(path.Join(publicURL, "/*"), app.ServeS3Media)
+```
+
+**请求**：
+```
+GET https://listmonk.example.com/s3-media/assets/images/photo.jpg
+```
+
+**路由匹配**：
+- `*` 匹配所有剩余路径：`"assets/images/photo.jpg"`
+- `c.Param("*")` 或 `c.Param("filepath")`（取决于实现）返回完整路径
+
+**处理器层**：
+- `key = "assets/images/photo.jpg"`
+- 传递给 `GetBlob("assets/images/photo.jpg")`
+
+**GetBlob 层**：
+```go
+// 输入：uurl = "assets/images/photo.jpg"
+
+// 第一处 filepath.Base
+if p, err := url.Parse("assets/images/photo.jpg"); err != nil {
+    // 解析失败，不是有效 URL
+    uurl = filepath.Base("assets/images/photo.jpg")  // = "photo.jpg"
+    // ⚠️ 目录层级 "assets/images/" 被丢弃！
+}
+
+// 构造 ObjectKey（假设 bucket_path = "assets/images"）
+ObjectKey: c.makeBucketPath(filepath.Base("photo.jpg"))
+// = c.makeBucketPath("photo.jpg")
+// = "assets/images" + "/" + "photo.jpg"
+// = "assets/images/photo.jpg"
+```
+
+**巧合场景分析**：
+- 在这个特定例子中，最终 ObjectKey 恰好正确
+- 但这是因为 `filepath.Base` 丢弃的路径 `assets/images/` 恰好等于 `bucket_path`
+- 如果路径结构不同，就会失败
+
+**场景 C：路径结构不同时的失败**
+
+**配置**：
+```toml
+[upload.s3]
+bucket_path = "assets"     # 注意：不是 "assets/images"
+public_url = "/s3-media"
+```
+
+**上传**：
+- 数据库 `media.filename` = `"images/photo.jpg"`（假设用户上传时带路径）
+- 实际 S3 对象键：`assets/images/photo.jpg`
+
+**URL 生成**：
+- `makeFileURL("images/photo.jpg")`
+- = `RootURL + "/s3-media" + "/" + makeBucketPath("images/photo.jpg")`
+- = `"https://listmonk.example.com/s3-media/assets/images/photo.jpg"`
+
+**访问**：
+- 请求 URL：`/s3-media/assets/images/photo.jpg`
+- 即使路由修复为通配符，`key = "assets/images/photo.jpg"`
+- `GetBlob("assets/images/photo.jpg")`:
+  - `filepath.Base("assets/images/photo.jpg")` = `"photo.jpg"`
+  - `makeBucketPath("photo.jpg")` = `"assets/photo.jpg"`
+  - **实际 S3 对象键是 `assets/images/photo.jpg`**
+  - ❌ **404 错误**！
+
+---
+
+### 5.10 保守修复建议
+
+考虑到向后兼容性和最小改动原则，提出以下保守修复方案：
+
+#### 方案 A：路由层修复（最小改动）
+
+**目标**：让请求能够到达处理器
+
+**修复代码**（`cmd/init.go:963`）：
+
+```go
+// 修复前
+srv.GET(path.Join(publicURL, "/:filepath"), app.ServeS3Media)
+
+// 修复后（使用 Echo 通配符路由）
+srv.GET(path.Join(publicURL, "/*"), app.ServeS3Media)
+```
+
+**Echo 通配符路由行为**：
+- `*` 匹配所有剩余路径（跨斜杠）
+- 通过 `c.Param("*")` 获取完整路径
+
+**注意**：需要确认 `ServeS3Media` 处理器中如何获取参数：
+
+```go
+// 修复后的 ServeS3Media
+func (a *App) ServeS3Media(c echo.Context) error {
+    // 通配符路由使用 "*" 作为参数名
+    key := c.Param("*")
+    // 或者同时兼容两种方式
+    if key == "" {
+        key = c.Param("filepath")
+    }
+    // ...
+}
+```
+
+**方案 A 评估**：
+
+| 维度 | 评估 |
+|------|------|
+| 改动范围 | 仅路由注册 |
+| 风险 | 低（Echo 标准功能） |
+| 是否解决所有问题 | 否（GetBlob 层的 filepath.Base 问题仍然存在） |
+| 适用场景 | bucket_path 为空，或者路径结构巧合匹配 |
+
+#### 方案 B：完整修复（路由 + GetBlob）
+
+**目标**：彻底解决带目录层级的对象键访问问题
+
+**修复内容**：
+
+**1. 路由层修复**（同方案 A）
+
+**2. GetBlob 层修复**
+
+**问题分析**：
+
+`GetBlob` 有两个调用场景：
+
+| 场景 | 调用方 | 传入值类型 | 期望行为 |
+|------|--------|-----------|----------|
+| 场景 1 | `ServeS3Media` | 相对路径（如 `"assets/image.jpg"`） | 直接使用作为 ObjectKey（或拼接 public_url 前缀后） |
+| 场景 2 | `GetAttachment` | 完整 URL（如 `"https://cdn.example.com/assets/image.jpg"`） | 从 URL 中提取 ObjectKey |
+
+**当前 `filepath.Base` 的问题**：
+- 场景 1 中：`filepath.Base("assets/image.jpg")` = `"image.jpg"` → 丢失目录
+- 场景 2 中：`filepath.Base("/assets/image.jpg")` = `"image.jpg"` → 可能需要完整路径
+
+**保守修复方案**：
+
+**思路**：
+- 保持场景 2 的向后兼容性（处理完整 URL）
+- 对场景 1（相对路径代理）进行特殊处理
+
+**实现方式**：
+- 在 `ServeS3Media` 中明确标识这是"相对路径代理场景"
+- 修改 `GetBlob` 或添加新方法
+
+**修复代码**：
+
+**选项 B1：添加新的 Store 方法（推荐，向后兼容）**
+
+```go
+// 在 media.Store 接口中添加新方法（可选，或者使用扩展接口）
+type Store interface {
+    // 现有方法
+    Put(string, string, io.ReadSeeker) (string, error)
+    Delete(string) error
+    GetURL(string) string
+    GetBlob(string) ([]byte, error)
+    
+    // 新方法：用于相对路径代理场景
+    // 直接使用完整路径作为 ObjectKey，不做 filepath.Base 处理
+    GetBlobByFullPath(string) ([]byte, error)
+}
+
+// S3 实现
+func (c *Client) GetBlobByFullPath(fullPath string) ([]byte, error) {
+    // 直接使用完整路径，不做任何处理
+    // 注意：这里假设 fullPath 已经是相对于 bucket 的完整路径
+    // 或者需要根据 public_url 前缀来判断
+    
+    // 更安全的方式：如果是相对路径代理场景，public_url 已知
+    // 可以在调用时传入前缀信息，或者这里简单处理
+    
+    // 简化版本：假设 fullPath 已经是完整的 ObjectKey
+    file, err := c.s3.FileDownload(simples3.DownloadInput{
+        Bucket:    c.opts.Bucket,
+        ObjectKey: fullPath,  // 直接使用
+    })
+    if err != nil {
+        return nil, err
+    }
+    
+    b, err := io.ReadAll(file)
+    if err != nil {
+        return nil, err
+    }
+    defer file.Close()
+    
+    return b, nil
+}
+
+// ServeS3Media 修改
+func (a *App) ServeS3Media(c echo.Context) error {
+    key := c.Param("*")  // 使用通配符获取完整路径
+    if key == "" {
+        return echo.NewHTTPError(http.StatusBadRequest, "missing media file path")
+    }
+    
+    // ⚠️ 关键：需要构造正确的 ObjectKey
+    // URL 生成逻辑：makeFileURL(name) = public_url + "/" + makeBucketPath(name)
+    // 所以 key = public_url_prefix + "/" + actual_object_key
+    // 我们需要从 key 中提取 actual_object_key
+    
+    // 更简单的方案：修改 URL 生成逻辑
+    // 让 URL 中的路径直接等于 ObjectKey
+    // 或者在路由处理器中知道 public_url 配置，进行路径裁剪
+    
+    // 最保守方案：修改 makeFileURL 和路由的配合方式
+    // 让 URL 路径部分直接等于 ObjectKey（包含 bucket_path）
+    // 这样 ServeS3Media 可以直接使用通配符获取的路径作为 ObjectKey
+    
+    // 临时方案：使用新方法
+    var b []byte
+    var err error
+    
+    // 尝试使用完整路径
+    b, err = a.media.(interface{
+        GetBlobByFullPath(string) ([]byte, error)
+    }).GetBlobByFullPath(key)
+    
+    if err != nil {
+        // 回退到旧方法
+        b, err = a.media.GetBlob(key)
+    }
+    
+    if err != nil {
+        a.log.Printf("error fetching media from s3 %s: %v", key, err)
+        return echo.NewHTTPError(http.StatusInternalServerError, "error fetching media")
+    }
+    
+    return c.Stream(http.StatusOK, http.DetectContentType(b), bytes.NewReader(b))
+}
+```
+
+**选项 B2：修改现有 GetBlob 方法（风险较高）**
+
+```go
+// 更智能的 GetBlob
+func (c *Client) GetBlob(uurl string) ([]byte, error) {
+    var objectKey string
+    
+    // 检测是否是完整 URL
+    if p, err := url.Parse(uurl); err == nil && p.Scheme != "" {
+        // 是完整 URL，保持原有行为（向后兼容）
+        objectKey = filepath.Base(p.Path)
+    } else {
+        // 不是完整 URL，可能是相对路径代理场景
+        // 直接使用（不做 filepath.Base 处理）
+        // 但需要考虑如何与 makeBucketPath 配合
+        
+        // 问题：这里不知道是否需要拼接 bucket_path
+        // 因为 URL 生成时已经包含了 bucket_path
+        
+        // 更合理的设计：
+        // - 如果是相对路径代理场景，URL 路径应该直接等于 ObjectKey
+        // - makeFileURL 应该生成：public_url + "/" + makeBucketPath(name)
+        // - 所以请求路径应该包含完整的 ObjectKey（包含 bucket_path）
+        // - 这里应该直接使用 uurl 作为 ObjectKey
+        
+        // 但这会改变现有行为...
+        
+        // 保守方案：尝试完整路径，如果失败再尝试文件名
+        // 但这有性能问题
+        
+        // 最保守：保持现有行为，文档说明限制
+        // 或者在配置层面限制：相对路径 public_url 时 bucket_path 必须为空
+        
+        objectKey = uurl  // 直接使用（修改现有行为）
+    }
+    
+    // 下载
+    file, err := c.s3.FileDownload(simples3.DownloadInput{
+        Bucket:    c.opts.Bucket,
+        ObjectKey: objectKey,
+    })
+    // ...
+}
+```
+
+**方案 B 评估**：
+
+| 维度 | 评估 |
+|------|------|
+| 改动范围 | 路由 + Store 接口 + 实现 |
+| 风险 | 中（需要考虑向后兼容性） |
+| 是否解决所有问题 | 是（如果设计正确） |
+| 适用场景 | 所有带目录层级的场景 |
+
+#### 方案 C：文档限制 + 配置验证（最保守）
+
+**目标**：不修改代码，通过文档和配置验证避免问题
+
+**实现**：
+
+1. **添加配置验证**（`cmd/init.go`）：
+
+```go
+case uploadProvider == "s3" && strings.HasPrefix(publicURL, "/"):
+    // 验证：相对路径 public_url 时，bucket_path 必须为空
+    bucketPath := ko.String("upload.s3.bucket_path")
+    if bucketPath != "" && bucketPath != "/" {
+        lo.Fatalf("when using relative path public_url, upload.s3.bucket_path must be empty or '/'")
+    }
+    
+    srv.GET(path.Join(publicURL, "/:filepath"), app.ServeS3Media)
+```
+
+2. **更新文档**：
+   - 明确说明相对路径 `public_url` 的限制
+   - 推荐使用绝对路径 `public_url`（CDN）或预签名 URL
+
+**方案 C 评估**：
+
+| 维度 | 评估 |
+|------|------|
+| 改动范围 | 添加配置验证 |
+| 风险 | 低（启动时检查，不影响运行时） |
+| 是否解决所有问题 | 否（只是避免问题，不是解决问题） |
+| 适用场景 | 现有用户，不愿承担修改风险 |
+
+#### 推荐方案组合
+
+**短期（立即执行）**：方案 C（配置验证 + 文档）
+- 防止新用户踩坑
+- 不影响现有代码
+
+**中期（计划内）**：方案 A（路由通配符）
+- 让请求能够到达处理器
+- 为后续修复铺路
+
+**长期（完整方案）**：方案 B（完整修复）
+- 重新设计 `GetBlob` 或 URL 生成逻辑
+- 彻底解决带目录层级的问题
+
+---
+
 ## 6. 媒体上传流程
 
 ### 6.1 完整上传流程
@@ -1524,4 +2132,158 @@ CREATE TABLE media (
 );
 ```
 
-### 16
+### 16.2 campaigns 表（邮件正文）
+
+```sql
+-- 核心字段（简化版）
+CREATE TABLE campaigns (
+    id           SERIAL PRIMARY KEY,
+    uuid         UUID NOT NULL UNIQUE,
+    name         TEXT NOT NULL,
+    body         TEXT,           -- ⚠️ 包含完整 URL 的 HTML 正文
+    body_source  TEXT,           -- 正文源码（如可视化编辑器 JSON）
+    altbody      TEXT,           -- 纯文本备选正文
+    status       TEXT NOT NULL,  -- draft, running, paused, finished, cancelled
+    created_at   TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at   TIMESTAMP WITH TIME ZONE
+);
+```
+
+### 16.3 templates 表（模板正文）
+
+```sql
+-- 核心字段（简化版）
+CREATE TABLE templates (
+    id          SERIAL PRIMARY KEY,
+    uuid        UUID NOT NULL UNIQUE,
+    name        TEXT NOT NULL,
+    type        TEXT NOT NULL,   -- "campaign" 或 "tx"
+    subject     TEXT,
+    body        TEXT,           -- ⚠️ 包含完整 URL 的 HTML 正文
+    body_source TEXT,           -- 正文源码
+    created_at  TIMESTAMP WITH TIME ZONE DEFAULT NOW(),
+    updated_at  TIMESTAMP WITH TIME ZONE
+);
+```
+
+### 16.4 campaign_media 关联表（媒体附件）
+
+```sql
+-- 核心字段（简化版）
+CREATE TABLE campaign_media (
+    campaign_id INTEGER NOT NULL REFERENCES campaigns(id) ON DELETE CASCADE,
+    media_id    INTEGER NOT NULL REFERENCES media(id) ON DELETE CASCADE,
+    PRIMARY KEY (campaign_id, media_id)
+);
+```
+
+**关键区别**：
+- `campaigns.body` / `templates.body`：存储**完整 HTML**，其中 `<img src="">` 包含**完整 URL**
+- `campaign_media`：通过 ID 关联，发送时**动态读取**文件内容，不依赖 URL
+
+---
+
+## 17. 总结与建议
+
+### 17.1 核心发现
+
+通过二次核查，发现以下关键结论：
+
+#### 关于邮件正文内联图片 URL
+
+| 维度 | 发现 |
+|------|------|
+| **写入时机** | 编辑阶段（前端插入图片时） |
+| **存储格式** | 完整 URL（包含域名、路径） |
+| **发送处理** | 无重写机制，直接使用保存的 URL |
+| **切换存储后** | 历史正文保留旧 URL，不会自动迁移 |
+
+#### 关于 S3 相对路径代理
+
+| 维度 | 发现 |
+|------|------|
+| **路由参数** | 使用 `:filepath` 单段参数，无法匹配多级路径 |
+| **路径处理** | `GetBlob` 使用 `filepath.Base()` 丢弃目录层级 |
+| **支持的配置** | `bucket_path` 必须为空 |
+| **不支持的配置** | `bucket_path` 不为空 + 相对路径 `public_url` |
+
+### 17.2 架构设计的权衡
+
+Listmonk 的媒体系统设计体现了以下权衡：
+
+#### 优点
+
+1. **媒体元数据层的灵活性**：`media` 表采用相对路径存储，URL 动态生成，支持无缝切换存储后端
+2. **接口抽象**：`media.Store` 接口使得添加新的存储后端非常容易
+3. **多种 S3 访问模式**：支持公共 CDN、相对路径代理、预签名 URL 等多种模式
+
+#### 缺点/限制
+
+1. **邮件正文层的不灵活性**：正文保存完整 URL，切换存储后历史链接失效
+2. **S3 代理的设计缺陷**：不支持带目录层级的对象键
+3. **缺乏迁移工具**：没有内置的媒体文件迁移和 URL 重写工具
+
+### 17.3 使用建议
+
+#### 新部署建议
+
+1. **选择合适的存储后端**：
+   - 小型单服务器部署：使用 `filesystem`
+   - 多实例或高可用需求：使用 `S3 + CDN`
+
+2. **如果使用 S3**：
+   - 使用相对路径 `public_url` 时，`bucket_path` 必须为空
+   - 需要 `bucket_path` 时，使用绝对路径 `public_url`（CDN）或预签名 URL
+
+3. **考虑使用 CDN 作为中间层**：
+   - 配置 `public_url = "https://cdn.example.com/media"`
+   - 未来切换存储后端时，只需修改 CDN 的源站配置，URL 保持不变
+
+#### 切换存储后端建议
+
+1. **充分评估历史 Campaign 的重要性**：
+   - 如果历史 Campaign 必须保持可访问：
+     - 保持旧存储可用（作为只读）
+     - 或使用 CDN 中间层
+     - 或手动迁移（更新数据库 + 迁移文件）
+
+2. **制定迁移计划**：
+   - 备份数据库和媒体文件
+   - 在测试环境验证
+   - 分批迁移或灰度切换
+
+3. **手动迁移脚本示例思路**：
+   ```
+   1. 遍历 media 表
+   2. 对于每个记录：
+      a. 从旧存储 GetBlob(filename)
+      b. 到新存储 Put(filename, content)
+   3. 遍历 campaigns 表和 templates 表
+   4. 对于每个 body 字段：
+      a. 正则匹配旧 URL 模式
+      b. 替换为新 URL 模式
+   5. 更新数据库记录
+   ```
+
+#### 生产环境监控建议
+
+1. **监控媒体访问**：
+   - 监控 `ServeS3Media` 的 404 错误
+   - 监控 `GetBlob` 的错误日志
+
+2. **配置验证**：
+   - 确认 `bucket_path` 和 `public_url` 的组合是支持的
+   - 测试上传和访问流程
+
+3. **定期备份**：
+   - 数据库备份
+   - 媒体文件备份
+
+---
+
+**报告版本**：v2.0（二次核查更新版）
+**生成日期**：2026-05-05
+**核查范围**：
+- 邮件正文内联图片 URL 处理时机
+- 存储切换后历史链接迁移机制
+- S3 相对路径代理行为边界与失败场景
