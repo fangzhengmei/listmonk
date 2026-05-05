@@ -570,14 +570,50 @@ WHERE $9 = 'delete'
 
 ### 6.5 动作类型详解
 
-| 动作 | 行为 | 适用场景 |
-|------|------|----------|
-| `none` | 仅记录退信，不改变订阅者状态 | 软退信，可重试 |
-| `blocklist` | 将订阅者状态设为 `blocklisted`，同时从所有列表退订 | 硬退信、投诉 |
-| `unsubscribe` | 仅从所有邮件列表退订，不拉黑 | 需要用户主动重新订阅 |
-| `delete` | 从数据库完全删除订阅者记录 | GDPR 等合规要求 |
+**核心证据**：`queries/bounces.sql:14-20`
+
+```sql
+-- block1: 仅当 $9 = 'blocklist' 时执行
+block1 AS (
+    UPDATE subscribers SET status='blocklisted'
+    WHERE $9 = 'blocklist' ...
+),
+-- block2: 仅当 $9 = 'unsubscribe' 时执行
+block2 AS (
+    UPDATE subscriber_lists SET status='unsubscribed'
+    WHERE $9 = 'unsubscribe' ...
+),
+```
+
+**关键发现**：`block1` 和 `block2` 的执行条件是**互斥**的，取决于 `$9`（即配置的 `action` 值）。
+
+| 动作 | 实际行为 | 证据位置 | 适用场景 |
+|------|----------|----------|----------|
+| `none` | 仅记录退信到 `bounces` 表，**不做任何状态更新** | 两个 CTE 条件都不满足 | 软退信，可重试 |
+| `blocklist` | **仅**将 `subscribers.status` 设为 `'blocklisted'`，**不会**更新 `subscriber_lists` | `block1` 条件 `$9 = 'blocklist'` | 硬退信、投诉 |
+| `unsubscribe` | **仅**将 `subscriber_lists.status` 设为 `'unsubscribed'`，**不会**更新 `subscribers.status` | `block2` 条件 `$9 = 'unsubscribe'` | 需要用户主动重新订阅 |
+| `delete` | 从 `subscribers` 表删除订阅者记录 | 最后的 `DELETE` 语句 | GDPR 等合规要求 |
+
+**重要澄清**：
+- `blocklist` **不会**同步退订列表，这与 `blocklist-bounced-subscribers` 手动 API 不同
+- `unsubscribe` **不会**改变订阅者的全局状态，只是从列表中退订
 
 ### 6.6 状态流转
+
+**核心证据**：
+1. `queries/bounces.sql:15` - 仅设置 `status='blocklisted'`
+2. `models/subscribers.go:14-22` - 状态常量定义
+3. `internal/migrations/v0.7.0.go:40` - ENUM 类型定义
+
+```go
+const (
+    SubscriberStatusEnabled     = "enabled"
+    SubscriberStatusDisabled    = "disabled"    // 退信处理中未使用
+    SubscriberStatusBlockListed = "blocklisted"
+)
+```
+
+**实际状态流转**（退信处理范围内）：
 
 ```
                     ┌──────────────┐
@@ -588,17 +624,21 @@ WHERE $9 = 'delete'
                            │ 动作: blocklist
                            ▼
                     ┌──────────────┐
-                    │ blocklisted  │ ← 拉黑状态
-                    └──────────────┘
-                           │
-                           │ 手动恢复 / 管理员操作
-                           ▼
-                    ┌──────────────┐
-                    │  disabled    │ ← 禁用状态
+                    │ blocklisted  │ ← 拉黑状态（终止状态）
                     └──────────────┘
 ```
 
-**注意**：一旦进入 `blocklisted` 状态，后续的退信将**不会**被记录（见 SQL 中的 `WHERE NOT EXISTS` 条件）。
+**关于 `disabled` 状态的澄清**：
+
+`disabled` 状态**不在退信处理流程中使用**。它的实际用途：
+
+1. **ENUM 类型定义**：`internal/migrations/v0.7.0.go:40` 定义了 `subscriber_status AS ENUM ('enabled', 'disabled', 'blocklisted')`
+2. **退信关键词匹配**：`internal/bounce/mailbox/pop.go:59` 中 `account.*disabled` 是用来**匹配邮件内容**的关键词，用于识别硬退信
+3. **可能的手动操作**：管理员可能通过其他方式将订阅者设为 `disabled`，但这不是退信自动处理的一部分
+
+**注意**：
+- 一旦进入 `blocklisted` 状态，后续的退信将**不会**被记录（见 SQL 中的 `WHERE NOT EXISTS` 条件：`(SELECT status FROM sub) = 'blocklisted'`）
+- `blocklisted` 是退信处理中的**终止状态**，没有自动流转到其他状态的逻辑
 
 ### 6.7 阈值计数逻辑
 
